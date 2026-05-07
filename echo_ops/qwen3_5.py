@@ -32,7 +32,7 @@ import torch
 from openvino import Type
 import openvino.opset14 as opset
 
-from .ops import GatedDeltaRule, GatedRMSNorm, L2Norm, ShortConv1D
+from .ops import GatedDeltaRule, GatedDeltaRuleStep, GatedRMSNorm, L2Norm, ShortConv1D
 
 
 # ---------------------------------------------------------------------------
@@ -353,3 +353,284 @@ def build_text_prefill(input_ids_param, model, B: int, T: int):
     h = build_qwen_rmsnorm(h, text_model.norm.weight.detach().numpy(), eps)
     return opset.matmul(h, _const(model.lm_head.weight.detach().numpy()),
                         False, True)
+
+
+# ---------------------------------------------------------------------------
+# Decode-mode builders (single-token, with caches)
+# ---------------------------------------------------------------------------
+
+def build_gated_deltanet_decode(h, layer, conv_state_in, recurrent_state_in,
+                                B: int, text_config):
+    """Single-token gated DeltaNet update with cached state.
+
+    h:                 [B, 1, hidden]
+    conv_state_in:     [B, conv_dim, K]                       (rolling conv window)
+    recurrent_state_in:[B, num_v_heads, head_k_dim, head_v_dim]
+
+    Returns: (output[B,1,hidden], new_conv_state, new_recurrent_state).
+    """
+    Hk = text_config.linear_key_head_dim
+    Hv = text_config.linear_value_head_dim
+    Nk = text_config.linear_num_key_heads
+    Nv = text_config.linear_num_value_heads
+    K  = text_config.linear_conv_kernel_dim
+    eps = text_config.rms_norm_eps
+    key_dim = Hk * Nk
+    value_dim = Hv * Nv
+    assert Nv == Nk, "this builder assumes num_v_heads == num_k_heads"
+
+    Wqkv = layer.in_proj_qkv.weight.detach().numpy()
+    Wz   = layer.in_proj_z.weight.detach().numpy()
+    Wb   = layer.in_proj_b.weight.detach().numpy()
+    Wa   = layer.in_proj_a.weight.detach().numpy()
+    Wout = layer.out_proj.weight.detach().numpy()
+    # nn.Conv1d weights: [conv_dim, 1, K]. For decode the convolution applies
+    # at the right edge of [conv_state | new_token]; with that K-step window
+    # taken in natural time-order, the dot product uses nn.Conv1d's weight
+    # as-is (no flip): out[c] = sum_i nn_weight[c, i] * window[c, i].
+    nn_weight = layer.conv1d.weight.detach().numpy().squeeze(1)        # [conv_dim, K]
+    A_log    = layer.A_log.detach().numpy()
+    dt_bias  = layer.dt_bias.detach().numpy()
+    norm_w   = layer.norm.weight.detach().numpy()
+
+    # in_proj_qkv -> [B, 1, conv_dim] -> [B, conv_dim, 1] for the conv pipeline
+    mixed_qkv = opset.matmul(h, _const(Wqkv), False, True)
+    mixed_qkv_t = opset.transpose(mixed_qkv, _const_i64([0, 2, 1]))
+
+    # Window: [conv_state | mixed_qkv_t]   shape [B, conv_dim, K + 1]
+    window = opset.concat([conv_state_in, mixed_qkv_t], axis=2)
+    # New conv state = window[..., 1:K+1]   (drop oldest, keep last K)
+    new_conv_state = opset.slice(
+        window,
+        _const_i64([1]), _const_i64([K + 1]), _const_i64([1]), _const_i64([2]))
+
+    # Single-step depthwise conv at the right edge:
+    #   conv_out[c] = sum_i nn_weight[c, i] * new_conv_state[c, i]
+    weight_b = opset.unsqueeze(_const(nn_weight), _const_i64(0))       # [1, conv_dim, K]
+    prod = opset.multiply(new_conv_state, weight_b)                    # [B, conv_dim, K]
+    conv_out = opset.reduce_sum(prod, _const_i64([2]), keep_dims=True) # [B, conv_dim, 1]
+    conv_out = opset.transpose(conv_out, _const_i64([0, 2, 1]))        # [B, 1, conv_dim]
+    mixed_qkv_act = opset.swish(conv_out)                              # silu
+
+    # Split into q, k, v and reshape per-head
+    sp = opset.variadic_split(
+        mixed_qkv_act, _const_i64(-1), _const_i64([key_dim, key_dim, value_dim]))
+    q_flat = sp.output(0); k_flat = sp.output(1); v_flat = sp.output(2)
+
+    def reshape_heads(t, num_heads, hd):
+        return opset.reshape(
+            t, _const_i64([B, 1, num_heads, hd]), special_zero=False)
+
+    q = reshape_heads(q_flat, Nk, Hk)
+    k = reshape_heads(k_flat, Nk, Hk)
+    v = reshape_heads(v_flat, Nv, Hv)
+
+    z = opset.matmul(h, _const(Wz), False, True)
+    z = reshape_heads(z, Nv, Hv)
+
+    b_node = opset.matmul(h, _const(Wb), False, True)
+    beta = opset.sigmoid(b_node)                                       # [B, 1, Nv]
+
+    a_node = opset.matmul(h, _const(Wa), False, True)
+    a_plus = opset.add(a_node, _const(dt_bias))
+    sp_a = opset.softplus(a_plus)
+    g_log = opset.multiply(_const(-np.exp(A_log)), sp_a)
+    g_actual = opset.exp(g_log)                                        # [B, 1, Nv]
+
+    # Squeeze the T=1 axis for the Step op.
+    one_axis = _const_i64([1])
+    q_step    = opset.squeeze(q, one_axis)        # [B, Nk, Hk]
+    k_step    = opset.squeeze(k, one_axis)
+    v_step    = opset.squeeze(v, one_axis)        # [B, Nv, Hv]
+    g_step    = opset.squeeze(g_actual, one_axis) # [B, Nv]
+    beta_step = opset.squeeze(beta, one_axis)
+
+    # L2 norm + 1/sqrt(Hk) scaling on q
+    q_n = L2Norm([q_step], eps=1e-6)
+    k_n = L2Norm([k_step], eps=1e-6)
+    q_scaled = opset.multiply(q_n, _const(np.float32(1.0 / math.sqrt(Hk))))
+
+    # Single-step recurrent update
+    step = GatedDeltaRuleStep(
+        [recurrent_state_in, q_scaled, k_n, v_step, g_step, beta_step])
+    new_recurrent_state = step.output(0)        # [B, Nv, Hk, Hv]
+    o_step = step.output(1)                     # [B, Nv, Hv]
+
+    # Restore the T=1 axis and run GatedRMSNorm + out_proj
+    o_unsq = opset.unsqueeze(o_step, one_axis)  # [B, 1, Nv, Hv]
+    flat = _const_i64([-1, Hv])
+    core_flat = opset.reshape(o_unsq, flat, special_zero=False)
+    z_flat = opset.reshape(z, flat, special_zero=False)
+    post = GatedRMSNorm([core_flat, z_flat, _const(norm_w)], eps=eps)
+    post = opset.reshape(
+        post, _const_i64([B, 1, value_dim]), special_zero=False)
+    output = opset.matmul(post, _const(Wout), False, True)
+    return output, new_conv_state, new_recurrent_state
+
+
+def _repeat_kv_dynamic(kv, group_size: int, B: int, num_kv_heads: int,
+                       head_dim: int):
+    """GQA repeat where the T axis is dynamic. Equivalent to repeat_interleave
+    on dim=1 by `group_size`."""
+    if group_size == 1:
+        return kv
+    # [B, kvh, T, hd] -> [B, kvh, 1, T, hd] -> tile g -> [B, kvh*g, T, hd]
+    kv5 = opset.unsqueeze(kv, _const_i64(2))
+    kv5 = opset.tile(kv5, _const_i64([1, 1, group_size, 1, 1]))
+    return opset.reshape(
+        kv5,
+        _const_i64([B, num_kv_heads * group_size, -1, head_dim]),
+        special_zero=False)
+
+
+def build_full_attention_decode(h, attn, cos_p, sin_p, k_cache_in, v_cache_in,
+                                B: int, num_heads: int, num_kv_heads: int,
+                                head_dim: int, rotary_dim: int, eps: float):
+    """Full attention with KV cache for a single new token.
+
+    h:           [B, 1, hidden]
+    cos_p, sin_p:[B, 1, rotary_dim]   (cos/sin gathered at the new position)
+    k/v_cache_in:[B, num_kv_heads, T_past, head_dim]  (T_past dynamic)
+
+    Returns: (output[B,1,hidden], new_k_cache, new_v_cache) where the new
+    caches have the new token appended along the T axis.
+    """
+    Wq = attn.q_proj.weight.detach().numpy()
+    Wk = attn.k_proj.weight.detach().numpy()
+    Wv = attn.v_proj.weight.detach().numpy()
+    Wo = attn.o_proj.weight.detach().numpy()
+    qn = attn.q_norm.weight.detach().numpy()
+    kn = attn.k_norm.weight.detach().numpy()
+
+    q_full = opset.matmul(h, _const(Wq), False, True)
+    q_full = opset.reshape(
+        q_full, _const_i64([B, 1, num_heads, head_dim * 2]), special_zero=False)
+    sp = opset.variadic_split(q_full, _const_i64(-1), _const_i64([head_dim, head_dim]))
+    q = sp.output(0)
+    gate = sp.output(1)
+    gate = opset.reshape(
+        gate, _const_i64([B, 1, num_heads * head_dim]), special_zero=False)
+
+    k_new = opset.matmul(h, _const(Wk), False, True)
+    k_new = opset.reshape(
+        k_new, _const_i64([B, 1, num_kv_heads, head_dim]), special_zero=False)
+    v_new = opset.matmul(h, _const(Wv), False, True)
+    v_new = opset.reshape(
+        v_new, _const_i64([B, 1, num_kv_heads, head_dim]), special_zero=False)
+
+    q = build_qwen_rmsnorm(q, qn, eps)
+    k_new = build_qwen_rmsnorm(k_new, kn, eps)
+
+    perm = _const_i64([0, 2, 1, 3])
+    q = opset.transpose(q, perm)            # [B, num_heads, 1, hd]
+    k_new = opset.transpose(k_new, perm)    # [B, num_kv_heads, 1, hd]
+    v_new = opset.transpose(v_new, perm)
+
+    q, k_new = build_partial_rope(q, k_new, cos_p, sin_p, rotary_dim, head_dim)
+
+    # Append to caches along T axis
+    new_k_cache = opset.concat([k_cache_in, k_new], axis=2)
+    new_v_cache = opset.concat([v_cache_in, v_new], axis=2)
+
+    # GQA expansion of the appended caches
+    group_size = num_heads // num_kv_heads
+    k_full = _repeat_kv_dynamic(new_k_cache, group_size, B, num_kv_heads, head_dim)
+    v_full = _repeat_kv_dynamic(new_v_cache, group_size, B, num_kv_heads, head_dim)
+
+    # SDPA: T_query = 1, so no causal mask needed (q sees all stored keys).
+    scale = _const(np.float32(1.0 / math.sqrt(head_dim)))
+    attn_out = opset.scaled_dot_product_attention(
+        q, k_full, v_full, attention_mask=None, scale=scale, causal=False)
+
+    attn_out = opset.transpose(attn_out, _const_i64([0, 2, 1, 3]))   # [B, 1, H, hd]
+    attn_out = opset.reshape(
+        attn_out, _const_i64([B, 1, num_heads * head_dim]), special_zero=False)
+    attn_out = opset.multiply(attn_out, opset.sigmoid(gate))
+    output = opset.matmul(attn_out, _const(Wo), False, True)
+    return output, new_k_cache, new_v_cache
+
+
+def precompute_rope_table(text_model, max_pos: int):
+    """Precompute cos/sin for every position in [0, max_pos) as a 2D table.
+
+    Returns numpy arrays of shape [max_pos, rotary_dim] each.
+    """
+    pos_ids = torch.arange(max_pos, dtype=torch.long).unsqueeze(0)
+    dummy = torch.zeros(1, 1, 1, dtype=torch.float32)
+    with torch.no_grad():
+        cos, sin = text_model.rotary_emb(dummy, pos_ids)
+    # cos shape [1, max_pos, rotary_dim]; collapse the leading batch dim.
+    return cos[0].detach().numpy(), sin[0].detach().numpy()
+
+
+def build_text_decode(input_ids, position_id, model, B: int,
+                      conv_states, recurrent_states, k_caches, v_caches):
+    """Build the single-token decode graph.
+
+    input_ids:        int64 Parameter [B, 1]
+    position_id:      int64 Parameter [B, 1]   (absolute position of the new token)
+    conv_states:      list of f32 Parameters [B, conv_dim, K]               (one per linear-attn layer)
+    recurrent_states: list of f32 Parameters [B, Nv, Hk, Hv]                (one per linear-attn layer)
+    k_caches:         list of f32 Parameters [B, num_kv_heads, ?, head_dim] (one per full-attn layer; T_past dynamic)
+    v_caches:         list of f32 Parameters [B, num_kv_heads, ?, head_dim]
+
+    Returns:
+        logits node [B, 1, vocab],
+        new_conv_states (list), new_recurrent_states (list),
+        new_k_caches (list), new_v_caches (list).
+    """
+    text_model = model.model.language_model
+    text_config = text_model.config
+    eps = text_config.rms_norm_eps
+    head_dim = text_config.head_dim
+    rope_pf = text_config.rope_parameters.get("partial_rotary_factor", 1.0)
+    rotary_dim = int(head_dim * rope_pf)
+
+    # Embed new token
+    embed_w = text_model.embed_tokens.weight.detach().numpy()
+    h = opset.gather(_const(embed_w), input_ids, _const_i64(0))         # [B, 1, hidden]
+
+    # Gather cos/sin at position_id from a precomputed table covering all positions.
+    cos_table, sin_table = precompute_rope_table(
+        text_model, text_config.max_position_embeddings)
+    cos_p = opset.gather(_const(cos_table), position_id, _const_i64(0)) # [B, 1, rotary_dim]
+    sin_p = opset.gather(_const(sin_table), position_id, _const_i64(0))
+
+    new_conv_states = []
+    new_recurrent_states = []
+    new_k_caches = []
+    new_v_caches = []
+    li = 0
+    fi = 0
+    for decoder in text_model.layers:
+        h_n = build_qwen_rmsnorm(
+            h, decoder.input_layernorm.weight.detach().numpy(), eps)
+        if decoder.layer_type == "linear_attention":
+            mix, new_conv, new_rec = build_gated_deltanet_decode(
+                h_n, decoder.linear_attn,
+                conv_states[li], recurrent_states[li], B, text_config)
+            new_conv_states.append(new_conv)
+            new_recurrent_states.append(new_rec)
+            li += 1
+        elif decoder.layer_type == "full_attention":
+            mix, new_k, new_v = build_full_attention_decode(
+                h_n, decoder.self_attn, cos_p, sin_p,
+                k_caches[fi], v_caches[fi],
+                B, text_config.num_attention_heads,
+                text_config.num_key_value_heads,
+                head_dim, rotary_dim, eps)
+            new_k_caches.append(new_k)
+            new_v_caches.append(new_v)
+            fi += 1
+        else:
+            raise ValueError(f"unknown layer_type {decoder.layer_type!r}")
+        h = opset.add(h, mix)
+
+        h_n = build_qwen_rmsnorm(
+            h, decoder.post_attention_layernorm.weight.detach().numpy(), eps)
+        h = opset.add(h, build_swiglu_mlp(h_n, decoder.mlp))
+
+    h = build_qwen_rmsnorm(h, text_model.norm.weight.detach().numpy(), eps)
+    logits = opset.matmul(
+        h, _const(model.lm_head.weight.detach().numpy()), False, True)
+    return logits, new_conv_states, new_recurrent_states, new_k_caches, new_v_caches
