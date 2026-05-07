@@ -135,6 +135,12 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", default=DEFAULT_MODEL)
     ap.add_argument("--prompt", default=DEFAULT_PROMPT)
+    ap.add_argument("--prompt-tokens", type=int, default=0,
+                    help="if > 0, ignore --prompt and use that many random "
+                         "token ids (sampled away from special tokens) -- "
+                         "useful for benchmarking long prefills / KV cache "
+                         "size at a target sequence length without needing "
+                         "a real prompt of that length")
     ap.add_argument("--steps", type=int, default=16,
                     help="number of decode steps to run")
     ap.add_argument("--max-position", type=int, default=4096)
@@ -159,12 +165,21 @@ def main():
     n_lin = len(linear_idx); n_full = len(full_idx)
     B = 1
 
-    # ---- Tokenize prompt -----------------------------------------------------
-    enc = tok(args.prompt, return_tensors="np")
-    input_ids_np = enc["input_ids"].astype(np.int64)
-    T_prefill = input_ids_np.shape[1]
-    print(f"prompt: {args.prompt!r}")
-    print(f"  tokenized to {T_prefill} ids")
+    # ---- Tokenize prompt (or synthesize random ids) --------------------------
+    if args.prompt_tokens > 0:
+        # Sample ids in [1000, 100000) to avoid both control tokens at the
+        # bottom and vision/special tokens near the top of the vocab.
+        rng = np.random.default_rng(0)
+        input_ids_np = rng.integers(
+            1000, 100000, size=(B, args.prompt_tokens), dtype=np.int64)
+        T_prefill = args.prompt_tokens
+        print(f"prompt: <synthetic, {T_prefill} random ids in [1000, 100000)>")
+    else:
+        enc = tok(args.prompt, return_tensors="np")
+        input_ids_np = enc["input_ids"].astype(np.int64)
+        T_prefill = input_ids_np.shape[1]
+        print(f"prompt: {args.prompt!r}")
+        print(f"  tokenized to {T_prefill} ids")
 
     # ---- Build & compile graphs ----------------------------------------------
     if T_prefill + args.steps > args.max_position:
