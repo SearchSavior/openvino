@@ -73,7 +73,7 @@ def _capture_cache(cache, linear_idx, full_idx):
     return out
 
 
-def build_decode_model(model, B: int):
+def build_decode_model(model, B: int, max_pos: int | None = None):
     """Construct the OV decode Model with all per-layer cache I/O wired up.
 
     Returns (ov_model, input_names, output_names) where the *_names lists
@@ -111,7 +111,8 @@ def build_decode_model(model, B: int):
         for i in range(n_full)]
 
     logits, new_conv, new_recur, new_k, new_v = build_text_decode(
-        ids_p, pos_p, model, B, conv_ps, recur_ps, k_ps, v_ps)
+        ids_p, pos_p, model, B, conv_ps, recur_ps, k_ps, v_ps,
+        max_pos=max_pos)
 
     results = [opset.result(logits, name="logits")]
     for i, n in enumerate(new_conv):
@@ -137,6 +138,9 @@ def main():
     ap.add_argument("--steps", type=int, default=4, help="decode steps to verify")
     ap.add_argument("--out", default="qwen3_5_text_decode.xml")
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--max-position", type=int, default=4096,
+                    help="size of the baked-in cos/sin table (caps the maximum "
+                         "absolute position the IR can serve)")
     args = ap.parse_args()
 
     torch.manual_seed(args.seed)
@@ -174,9 +178,14 @@ def main():
           f"recur shape={snap['recur'][0].shape}")
 
     # ---- Build OV decode graph and compile (single-thread, see prefill notes) ----
-    ov_model, _, _ = build_decode_model(model, B)
+    if args.prefill + args.steps > args.max_position:
+        raise SystemExit(
+            f"--max-position={args.max_position} is too small for prefill "
+            f"({args.prefill}) + steps ({args.steps}); raise it.")
+    ov_model, _, _ = build_decode_model(model, B, max_pos=args.max_position)
     print(f"built OV decode model: {len(ov_model.get_ordered_ops())} ops, "
-          f"{len(ov_model.inputs)} inputs, {len(ov_model.outputs)} outputs")
+          f"{len(ov_model.inputs)} inputs, {len(ov_model.outputs)} outputs "
+          f"(rope table covers {args.max_position} positions)")
     core = Core()
     core.set_property({"INFERENCE_NUM_THREADS": 1})
     compiled = core.compile_model(ov_model, "CPU")

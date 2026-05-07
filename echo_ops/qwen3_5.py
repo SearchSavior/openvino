@@ -564,7 +564,8 @@ def precompute_rope_table(text_model, max_pos: int):
 
 
 def build_text_decode(input_ids, position_id, model, B: int,
-                      conv_states, recurrent_states, k_caches, v_caches):
+                      conv_states, recurrent_states, k_caches, v_caches,
+                      max_pos: int | None = None):
     """Build the single-token decode graph.
 
     input_ids:        int64 Parameter [B, 1]
@@ -573,6 +574,11 @@ def build_text_decode(input_ids, position_id, model, B: int,
     recurrent_states: list of f32 Parameters [B, Nv, Hk, Hv]                (one per linear-attn layer)
     k_caches:         list of f32 Parameters [B, num_kv_heads, ?, head_dim] (one per full-attn layer; T_past dynamic)
     v_caches:         list of f32 Parameters [B, num_kv_heads, ?, head_dim]
+    max_pos:          size of the precomputed cos/sin table; defaults to
+                      `text_config.max_position_embeddings`. The exporter
+                      should cap this when the model's max context is huge
+                      relative to expected decode positions, since the
+                      table is baked into the IR.
 
     Returns:
         logits node [B, 1, vocab],
@@ -585,14 +591,15 @@ def build_text_decode(input_ids, position_id, model, B: int,
     head_dim = text_config.head_dim
     rope_pf = text_config.rope_parameters.get("partial_rotary_factor", 1.0)
     rotary_dim = int(head_dim * rope_pf)
+    if max_pos is None:
+        max_pos = text_config.max_position_embeddings
 
     # Embed new token
     embed_w = text_model.embed_tokens.weight.detach().numpy()
     h = opset.gather(_const(embed_w), input_ids, _const_i64(0))         # [B, 1, hidden]
 
     # Gather cos/sin at position_id from a precomputed table covering all positions.
-    cos_table, sin_table = precompute_rope_table(
-        text_model, text_config.max_position_embeddings)
+    cos_table, sin_table = precompute_rope_table(text_model, max_pos)
     cos_p = opset.gather(_const(cos_table), position_id, _const_i64(0)) # [B, 1, rotary_dim]
     sin_p = opset.gather(_const(sin_table), position_id, _const_i64(0))
 
