@@ -83,7 +83,8 @@ def main():
 
     h = opset.parameter([args.batch, args.seq_len, text_config.hidden_size],
                         dtype=Type.f32, name="hidden_states")
-    out = build_gated_deltanet(h, layer, args.batch, args.seq_len, text_config)
+    out, _conv, _recur = build_gated_deltanet(
+        h, layer, args.batch, args.seq_len, text_config)
     ov_model = Model([opset.result(out, name="output")], [h],
                      "Qwen3_5_GatedDeltaNet_Block")
     print(f"built OV model with {len(ov_model.get_ordered_ops())} ops")

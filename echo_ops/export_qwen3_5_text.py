@@ -83,10 +83,11 @@ def main():
     ref = torch_logits(model, input_ids).numpy()
     print(f"torch logits: {ref.shape}, |ref|_max={np.abs(ref).max():.5f}")
 
-    # Build OV graph
+    # Build OV graph (static T; dynamic-T variant lives in the benchmark script)
     ids_param = opset.parameter(
         [args.batch, args.seq_len], dtype=Type.i64, name="input_ids")
-    logits = build_text_prefill(ids_param, model, args.batch, args.seq_len)
+    logits, *_caches = build_text_prefill(
+        ids_param, model, args.batch, args.seq_len)
     ov_model = Model([opset.result(logits, name="logits")], [ids_param],
                      "Qwen3_5_TextPrefill")
     print(f"built OV model with {len(ov_model.get_ordered_ops())} ops")
