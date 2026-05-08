@@ -43,6 +43,25 @@ def _np(tensor, dtype=None):
     return arr
 
 
+def _f32_in(tensor):
+    """Read an OV Tensor as f32 (upcasting from f16/bf16 if needed). Also
+    returns the original dtype so callers can downcast outputs back."""
+    arr = np.asarray(tensor.data)
+    orig = arr.dtype
+    if orig != np.float32:
+        arr = arr.astype(np.float32)
+    return arr, orig
+
+
+def _set_outputs_dtyped(outputs, arrays, target_dtype):
+    """Copy numpy arrays into OV Tensor outputs, casting to `target_dtype`."""
+    for i, arr in enumerate(arrays):
+        if arr.dtype != target_dtype:
+            arr = arr.astype(target_dtype)
+        outputs[i].shape = arr.shape
+        np.asarray(outputs[i].data)[...] = arr
+
+
 # ---------------------------------------------------------------------------
 # L2Norm
 # ---------------------------------------------------------------------------
@@ -74,9 +93,9 @@ class L2Norm(Op):
         return True
 
     def evaluate(self, outputs, inputs):
-        x = _np(inputs[0])
-        y = reference.l2_norm(x, eps=self._attrs["eps"]).astype(x.dtype, copy=False)
-        _set_outputs_from_tensors(outputs, [y])
+        x, in_dtype = _f32_in(inputs[0])
+        y = reference.l2_norm(x, eps=self._attrs["eps"])
+        _set_outputs_dtyped(outputs, [y], in_dtype)
         return True
 
     def has_evaluate(self):
@@ -117,10 +136,10 @@ class ShortConv1D(Op):
         return ShortConv1D.class_type_info
 
     def evaluate(self, outputs, inputs):
-        x = _np(inputs[0])
-        w = _np(inputs[1], dtype=x.dtype)
-        y = reference.short_conv1d(x, w).astype(x.dtype, copy=False)
-        _set_outputs_from_tensors(outputs, [y])
+        x, in_dtype = _f32_in(inputs[0])
+        w = _np(inputs[1], dtype=np.float32)
+        y = reference.short_conv1d(x, w)
+        _set_outputs_dtyped(outputs, [y], in_dtype)
         return True
 
     def has_evaluate(self):
@@ -179,16 +198,14 @@ class GatedDeltaRule(Op):
         return GatedDeltaRule.class_type_info
 
     def evaluate(self, outputs, inputs):
-        q = _np(inputs[0])
-        k = _np(inputs[1], dtype=q.dtype)
-        v = _np(inputs[2], dtype=q.dtype)
-        g = _np(inputs[3], dtype=q.dtype)
-        beta = _np(inputs[4], dtype=q.dtype)
-        s0 = _np(inputs[5], dtype=q.dtype)
+        q, in_dtype = _f32_in(inputs[0])
+        k = _np(inputs[1], dtype=np.float32)
+        v = _np(inputs[2], dtype=np.float32)
+        g = _np(inputs[3], dtype=np.float32)
+        beta = _np(inputs[4], dtype=np.float32)
+        s0 = _np(inputs[5], dtype=np.float32)
         o, s_final = reference.gated_delta_rule(q, k, v, g, beta, s0)
-        _set_outputs_from_tensors(outputs,
-                                  [o.astype(q.dtype, copy=False),
-                                   s_final.astype(q.dtype, copy=False)])
+        _set_outputs_dtyped(outputs, [o, s_final], in_dtype)
         return True
 
     def has_evaluate(self):
@@ -242,16 +259,14 @@ class GatedDeltaRuleStep(Op):
         return GatedDeltaRuleStep.class_type_info
 
     def evaluate(self, outputs, inputs):
-        s = _np(inputs[0])
-        q = _np(inputs[1], dtype=s.dtype)
-        k = _np(inputs[2], dtype=s.dtype)
-        v = _np(inputs[3], dtype=s.dtype)
-        g = _np(inputs[4], dtype=s.dtype)
-        beta = _np(inputs[5], dtype=s.dtype)
+        s, in_dtype = _f32_in(inputs[0])
+        q = _np(inputs[1], dtype=np.float32)
+        k = _np(inputs[2], dtype=np.float32)
+        v = _np(inputs[3], dtype=np.float32)
+        g = _np(inputs[4], dtype=np.float32)
+        beta = _np(inputs[5], dtype=np.float32)
         s_new, o = reference.gated_delta_rule_step(s, q, k, v, g, beta)
-        _set_outputs_from_tensors(outputs,
-                                  [s_new.astype(s.dtype, copy=False),
-                                   o.astype(s.dtype, copy=False)])
+        _set_outputs_dtyped(outputs, [s_new, o], in_dtype)
         return True
 
     def has_evaluate(self):
@@ -302,11 +317,11 @@ class GatedRMSNorm(Op):
         return True
 
     def evaluate(self, outputs, inputs):
-        x = _np(inputs[0])
-        gate = _np(inputs[1], dtype=x.dtype)
-        weight = _np(inputs[2], dtype=x.dtype)
+        x, in_dtype = _f32_in(inputs[0])
+        gate = _np(inputs[1], dtype=np.float32)
+        weight = _np(inputs[2], dtype=np.float32)
         y = reference.gated_rmsnorm(x, gate, weight, eps=self._attrs["eps"])
-        _set_outputs_from_tensors(outputs, [y.astype(x.dtype, copy=False)])
+        _set_outputs_dtyped(outputs, [y], in_dtype)
         return True
 
     def has_evaluate(self):
