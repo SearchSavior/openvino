@@ -159,6 +159,11 @@ def main():
     ap.add_argument("--T-step", type=int, default=256)
     ap.add_argument("--steps-per-T", type=int, default=12,
                     help="decode steps to run after each prefill")
+    ap.add_argument("--prefill-chunk", type=int, default=256,
+                    help="prefill in chunks of this many tokens, threading "
+                         "cache state between calls. Keeps OV's per-call "
+                         "scratch buffer bounded by chunk size rather than "
+                         "by total prompt length.")
     ap.add_argument("--device", default="CPU")
     ap.add_argument("--no-fp16", action="store_true",
                     help="bake constants as fp32 instead of fp16")
@@ -225,37 +230,51 @@ def main():
     rows = []
     feed = None
     out = None
+    chunk = max(1, args.prefill_chunk)
     for T in Ts:
         # Free prior-iteration tensors before allocating the next prefill's
         # activations -- avoids monotonic RSS growth that OOMs on 16 GiB.
         feed = None
         out = None
         gc.collect()
-        # ---- Prefill ---------------------------------------------------------
-        ids = full_prompt[:, :T]
-        positions = np.arange(T, dtype=np.int64)[None, :]
-        feed = {
-            "input_ids": Tensor(ids),
-            "position_ids": Tensor(positions),
-        }
-        for i in range(n_lin):
-            feed[f"conv_state_{i}"]  = Tensor(np.zeros((B, conv_dim, K), dtype=np_dtype))
-            feed[f"recur_state_{i}"] = Tensor(np.zeros((B, Nv, Hk, Hv), dtype=np_dtype))
-        for i in range(n_full):
-            feed[f"k_cache_{i}"] = Tensor(np.zeros((B, Nkv, 0, head_dim), dtype=np_dtype))
-            feed[f"v_cache_{i}"] = Tensor(np.zeros((B, Nkv, 0, head_dim), dtype=np_dtype))
+        # ---- Chunked prefill -------------------------------------------------
+        # Start from zero caches, then feed the prompt in `chunk`-sized
+        # windows, threading the unified graph's cache outputs back as its
+        # cache inputs for the next window. Each call's T_query is at most
+        # `chunk`, which caps OV's per-call scratch buffer regardless of T.
+        conv_states  = [np.zeros((B, conv_dim, K), dtype=np_dtype) for _ in range(n_lin)]
+        recur_states = [np.zeros((B, Nv, Hk, Hv), dtype=np_dtype)  for _ in range(n_lin)]
+        k_caches     = [np.zeros((B, Nkv, 0, head_dim), dtype=np_dtype) for _ in range(n_full)]
+        v_caches     = [np.zeros((B, Nkv, 0, head_dim), dtype=np_dtype) for _ in range(n_full)]
 
-        t0 = time.perf_counter()
-        out = compiled(feed)
-        prefill_ms = (time.perf_counter() - t0) * 1000
+        prefill_ms = 0.0
+        next_id = None
+        t_start = 0
+        while t_start < T:
+            t_end = min(t_start + chunk, T)
+            ids = full_prompt[:, t_start:t_end]
+            positions = np.arange(t_start, t_end, dtype=np.int64)[None, :]
+            feed = {
+                "input_ids":    Tensor(ids),
+                "position_ids": Tensor(positions),
+            }
+            for i, c in enumerate(conv_states):  feed[f"conv_state_{i}"]  = Tensor(c)
+            for i, r in enumerate(recur_states): feed[f"recur_state_{i}"] = Tensor(r)
+            for i, k in enumerate(k_caches):     feed[f"k_cache_{i}"]     = Tensor(k)
+            for i, v in enumerate(v_caches):     feed[f"v_cache_{i}"]     = Tensor(v)
 
-        logits = out[out_by_name["logits"]]
-        next_id = int(logits[0, -1].argmax())
-        conv_states  = [np.array(out[out_by_name[f"new_conv_state_{i}"]])  for i in range(n_lin)]
-        recur_states = [np.array(out[out_by_name[f"new_recur_state_{i}"]]) for i in range(n_lin)]
-        k_caches     = [np.array(out[out_by_name[f"new_k_cache_{i}"]])     for i in range(n_full)]
-        v_caches     = [np.array(out[out_by_name[f"new_v_cache_{i}"]])     for i in range(n_full)]
-        del out
+            t0 = time.perf_counter()
+            out = compiled(feed)
+            prefill_ms += (time.perf_counter() - t0) * 1000
+
+            logits = out[out_by_name["logits"]]
+            next_id = int(logits[0, -1].argmax())
+            conv_states  = [np.array(out[out_by_name[f"new_conv_state_{i}"]])  for i in range(n_lin)]
+            recur_states = [np.array(out[out_by_name[f"new_recur_state_{i}"]]) for i in range(n_lin)]
+            k_caches     = [np.array(out[out_by_name[f"new_k_cache_{i}"]])     for i in range(n_full)]
+            v_caches     = [np.array(out[out_by_name[f"new_v_cache_{i}"]])     for i in range(n_full)]
+            del out
+            t_start = t_end
 
         full_b  = sum(k.nbytes + v.nbytes for k, v in zip(k_caches, v_caches))
         conv_b  = sum(c.nbytes for c in conv_states)
