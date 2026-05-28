@@ -27,7 +27,8 @@ import numpy as np
 import openvino as ov
 
 sys.path.insert(0, str(Path(__file__).parent))
-from fused_linear_attn import register, replace_gated_delta_rule_loops  # noqa: E402
+from fused_linear_attn import register as register_la, replace_gated_delta_rule_loops  # noqa: E402
+from fused_conv1d import register as register_cv, replace_causal_conv1d_chains  # noqa: E402
 from lm_head_slice import slice_lm_head_to_last_token  # noqa: E402
 
 HIDDEN = 1024
@@ -132,6 +133,7 @@ def main():
     ap.add_argument("--model", default="/tmp/qwen3-work/qwen35-0.8b-int8/openvino_language_model.xml")
     ap.add_argument("--prompt-len", type=int, default=512)
     ap.add_argument("--fuse", action="store_true", help="apply fused-linear-attn rewrite")
+    ap.add_argument("--fuse-conv1d", action="store_true", help="apply fused causal-conv1d rewrite")
     ap.add_argument("--lm-head-slice", action="store_true", help="slice lm_head input to last token only")
     args = ap.parse_args()
 
@@ -145,16 +147,22 @@ def main():
         return r
 
     print(f"Model={args.model}  prompt_len={args.prompt_len}  "
-          f"fuse_linear_attn={args.fuse}  lm_head_slice={args.lm_head_slice}")
+          f"fuse_linear_attn={args.fuse}  fuse_conv1d={args.fuse_conv1d}  "
+          f"lm_head_slice={args.lm_head_slice}")
     snapshot("process start")
 
     core = ov.Core()
     if args.fuse:
-        register(core)
+        register_la(core)
+    if args.fuse_conv1d:
+        register_cv(core)
     model = core.read_model(args.model)
     if args.fuse:
         n = replace_gated_delta_rule_loops(model)
         print(f"  → fused-linear-attn applied to {n} Loops")
+    if args.fuse_conv1d:
+        n = replace_causal_conv1d_chains(model)
+        print(f"  → fused-conv1d applied to {n} chains")
     if args.lm_head_slice:
         ok = slice_lm_head_to_last_token(model)
         print(f"  → lm_head_slice applied: {ok}")
