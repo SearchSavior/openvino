@@ -29,6 +29,8 @@ import numpy as np
 import openvino as ov
 from openvino import Op
 
+from kernels import use_c as _use_c, gdr as _gdr_c
+
 
 class GatedDeltaRule(Op):
     """Fused linear-attention recurrence used in Qwen3-Next-family models."""
@@ -68,6 +70,19 @@ class GatedDeltaRule(Op):
         outputs[0].shape = (B, H, T, Dv)
         outputs[1].shape = S.shape
         out = np.asarray(outputs[0].data)
+
+        if _use_c():
+            q_c = np.ascontiguousarray(q, dtype=np.float32)
+            k_c = np.ascontiguousarray(k, dtype=np.float32)
+            v_c = np.ascontiguousarray(v, dtype=np.float32)
+            g_c = np.ascontiguousarray(g, dtype=np.float32)
+            b_c = np.ascontiguousarray(beta, dtype=np.float32)
+            S_c = np.ascontiguousarray(S, dtype=np.float32)
+            out_c = np.empty((B, H, T, Dv), dtype=np.float32)
+            _gdr_c(q_c, k_c, v_c, g_c, b_c, S_c, out_c)
+            out[...] = out_c
+            np.asarray(outputs[1].data)[...] = S_c
+            return True
 
         for t in range(T):
             q_t = q[:, :, t, :]

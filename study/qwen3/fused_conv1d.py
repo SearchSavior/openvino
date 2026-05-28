@@ -23,6 +23,8 @@ import numpy as np
 import openvino as ov
 from openvino import Op
 
+from kernels import use_c as _use_c, conv1d as _conv1d_c
+
 
 class FusedCausalConv1d(Op):
     def __init__(self, inputs=None):
@@ -66,6 +68,20 @@ class FusedCausalConv1d(Op):
 
         outputs[0].shape = (B, C, out_len)
         out = np.asarray(outputs[0].data)
+        outputs[1].shape = prev.shape
+        ns = np.asarray(outputs[1].data)
+
+        if _use_c():
+            prev_c = np.ascontiguousarray(prev, dtype=np.float32)
+            cur_c = np.ascontiguousarray(cur, dtype=np.float32)
+            wc_c = np.ascontiguousarray(wc, dtype=np.float32)
+            out_c = np.empty((B, C, out_len), dtype=np.float32)
+            ns_c = np.empty((B, C, KS), dtype=np.float32)
+            _conv1d_c(prev_c, cur_c, wc_c, out_c, ns_c)
+            out[...] = out_c
+            ns[...] = ns_c
+            return True
+
         out.fill(0.0)
 
         # For each kernel position k, the source index in the implicit padded sequence
@@ -81,8 +97,6 @@ class FusedCausalConv1d(Op):
                 out[..., cutover:] += wk * cur[..., : out_len - cutover]
 
         # new_state = last KS positions of (prev ++ cur).
-        outputs[1].shape = prev.shape
-        ns = np.asarray(outputs[1].data)
         if T >= KS:
             ns[...] = cur[..., T - KS: T]
         else:

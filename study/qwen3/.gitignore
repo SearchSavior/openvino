@@ -1,0 +1,3 @@
+libqwen3_kernels.so
+__pycache__/
+*.pyc
