@@ -1,36 +1,21 @@
 """
-Register our fused custom ops with OpenVINO GenAI pipelines.
+Drive Qwen3.5-VL through ov_genai.VLMPipeline with our fused custom ops loaded
+as a proper OpenVINO C++ extension library (cpp_ext/build/libqwen3_ov_ext.so).
 
-Two registration pathways were tried:
+Pipeline:
+  1. Read the original LM IR
+  2. Apply the three graph rewrites (gdr + conv1d + lm_head slice)
+  3. Serialize a fused model dir (other files symlinked)
+  4. VLMPipeline(fused_dir, "CPU", extensions=[str(.so)]) — registers the
+     custom op factories at the extension layer
+  5. Generate text via the high-level genai API
 
-  (1) extensions=[ov.OpExtension(cls)]   — documented in genai docs
-  (2) extensions=[str("path/to/lib.so")] — documented in genai docs
+Also runs the same thing through plain ov.Core() to confirm the .so on its own.
 
-In the current openvino_genai nightly (2026.0.0.0.dev20260127) neither (1) nor (2)
-is functional from the Python binding:
-  - (1) is rejected with "Property 'extensions' got unsupported type" (the
-    py::isinstance<ov::Extension>() check fails across the genai/ov module boundary).
-  - (2) is silently accepted but the .so is never actually loaded — bogus paths
-    don't raise, and the IR still fails to deserialize the custom op.
-
-Inspecting the binaries confirms it:
-  $ strings .../py_openvino_genai...so | grep -i extension       # → nothing
-  $ strings .../libopenvino_genai.so.2600 | grep extract_ext      # → nothing
-
-So the `extensions=` property exists in the docs / source but isn't built into
-the wheels yet. Track upstream openvinotoolkit/openvino.genai for when this lands.
-
-What works today:
-  - The C++ extension library `cpp_ext/build/libqwen3_ov_ext.so` is fully valid.
-  - Loading it through plain `ov.Core().add_extension(...)` + `read_model(...)`
-    correctly resolves both custom ops (see end-to-end test below).
-  - VLMPipeline today also fails for Qwen3.5-VL with
-      "Unsupported 'qwen3_5' VLM model type" — another gap on the genai side.
-
-Run this script to reproduce all of the above:
-  - exports a fused IR
-  - tries genai pipelines (LLM / VLM) and reports the exact failure
-  - falls back to ov.Core() to prove the .so itself is correct
+Requires openvino_genai >= 2026.3.x dev nightly — the extensions= property in
+the LLM/VLMPipeline binding shipped in the 2026.3 series. Install with:
+    uv pip install --system --pre -U openvino-genai \\
+        --extra-index-url https://storage.openvinotoolkit.org/simple/wheels/nightly
 """
 import argparse
 import os
@@ -80,29 +65,28 @@ def rewrite_and_save():
 
 
 def try_genai_extensions():
-    print("\n=== test (A): VLMPipeline(extensions=[str(so_path)]) ===")
-    try:
-        ov_genai.VLMPipeline(str(FUSED), "CPU", extensions=[str(SO_PATH)])
-        print("  loaded — feature works!")
-    except Exception as e:
-        print(f"  FAILED: {type(e).__name__}: {e}".replace("\n", " ")[:300])
+    prompt = "What is your show size?"
 
-    print("\n=== test (B): LLMPipeline(extensions=[str(so_path)]) ===")
-    try:
-        ov_genai.LLMPipeline(str(FUSED), "CPU", extensions=[str(SO_PATH)])
-        print("  loaded — feature works!")
-    except Exception as e:
-        print(f"  FAILED: {type(e).__name__}: {e}".replace("\n", " ")[:300])
+    cfg = ov_genai.GenerationConfig()
+    cfg.max_new_tokens = 32
 
-    print("\n=== test (C): LLMPipeline(extensions=[/tmp/does_not_exist.so]) ===")
+    print("\n=== (A) VLMPipeline + extensions=[str(.so)] + generate ===")
+    t0 = time.time()
+    vlm = ov_genai.VLMPipeline(str(FUSED), "CPU", extensions=[str(SO_PATH)])
+    print(f"  loaded in {time.time() - t0:.2f}s")
+    t0 = time.time()
+    out = vlm.generate(prompt, generation_config=cfg)
+    print(f"  generated in {time.time() - t0:.2f}s")
+    print(f"  output: {str(out)!r}")
+    del vlm
+
+    print("\n=== (B) sanity: extensions=[bogus_path] should error ===")
     try:
         ov_genai.LLMPipeline(str(FUSED), "CPU", extensions=["/tmp/does_not_exist.so"])
-        print("  loaded — but bogus path should have errored!")
-    except Exception as e:
-        if "FusedCausalConv1d" in str(e):
-            print("  (same error as test B — bogus path silently ignored, .so not loaded)")
-        else:
-            print(f"  FAILED with: {type(e).__name__}: {e}".replace("\n", " ")[:300])
+        print("  unexpectedly loaded — extension path not validated")
+    except RuntimeError as e:
+        msg = str(e).replace("\n", " ")[:200]
+        print(f"  errored as expected: {msg}")
 
 
 def run_via_ov_core():
