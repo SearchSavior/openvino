@@ -39,7 +39,10 @@ import numpy as np
 HERE = Path(__file__).resolve().parent
 SO = HERE / "cpp_ext/build/libqwen3_ov_ext.so"
 ORIG_XML = "/tmp/qwen3-work/qwen35-0.8b-int8/openvino_language_model.xml"
-FUSED_XML = "/tmp/qwen3-work/qwen35-0.8b-int8-fused/openvino_language_model.xml"
+# fused XML path is overridable so we can profile fused-light (no conv1d) too.
+FUSED_XML = os.environ.get(
+    "QWEN3_FUSED_XML",
+    "/tmp/qwen3-work/qwen35-0.8b-int8-fused/openvino_language_model.xml")
 HIDDEN = 1024
 WARMUP_RUNS = 1
 MEASURE_RUNS = 5
@@ -63,7 +66,10 @@ def prefill_inputs(seq):
 
 
 def classify(node_type: str, name: str, mode: str) -> str | None:
-    """Return a bucket label for ops we care about, else None."""
+    """Return a bucket label for ops we care about, else None.
+
+    Works for both `fused` (gdr+conv1d) and `fused-light` (gdr only).
+    """
     if mode == "unfused":
         if node_type == "GatedDeltaNet":
             return "linear_attn(GatedDeltaNet)"
@@ -72,11 +78,18 @@ def classify(node_type: str, name: str, mode: str) -> str | None:
         if node_type == "Slice" and "linear_attn/aten::cat/Concat" in name:
             return "conv1d_state(Slice)"
     else:
+        # In fused IRs, the gdr replacement is always present. The conv1d
+        # replacement is present only if it was applied at export time;
+        # otherwise we still see the plugin's GroupConvolution.
         if node_type == "Reference":
             if RE_GDR_FUSED.search(name):
                 return "linear_attn(GatedDeltaRule[fused])"
             if RE_CONV_FUSED.search(name):
                 return "conv1d(FusedCausalConv1d[fused])"
+        if node_type == "GroupConvolution" and RE_LINATTN.search(name):
+            return "conv1d(GroupConvolution)"
+        if node_type == "Slice" and "linear_attn/aten::cat/Concat" in name:
+            return "conv1d_state(Slice)"
     return None
 
 
@@ -143,7 +156,12 @@ def main():
 
     ap = argparse.ArgumentParser()
     ap.add_argument("--seqs", nargs="+", type=int, default=[128, 512, 1024, 2048])
+    ap.add_argument("--fused-xml",
+                    help="path to fused IR xml (default: env QWEN3_FUSED_XML or full fused)")
+    ap.add_argument("--label", default="fused")
     args = ap.parse_args()
+    if args.fused_xml:
+        os.environ["QWEN3_FUSED_XML"] = args.fused_xml
 
     if not SO.exists():
         sys.exit(f"missing {SO} — build cpp_ext first")

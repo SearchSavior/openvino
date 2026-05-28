@@ -23,7 +23,8 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 SO = HERE / "cpp_ext/build/libqwen3_ov_ext.so"
 ORIG = "/tmp/qwen3-work/qwen35-0.8b-int8"
-FUSED = "/tmp/qwen3-work/qwen35-0.8b-int8-fused"
+# The "fused" path defaults to the all-3-rewrites dir; override via --fused-dir.
+FUSED = os.environ.get("QWEN3_FUSED_DIR", "/tmp/qwen3-work/qwen35-0.8b-int8-fused")
 
 PHRASE = (
     "Computers are remarkable machines that process information through "
@@ -175,7 +176,14 @@ def main():
     ap.add_argument("--prompt-repeats", type=int, default=60,
                     help="how many times to repeat PHRASE (≈21 tokens each)")
     ap.add_argument("--max-new-tokens", type=int, default=64)
+    ap.add_argument("--fused-dir",
+                    help="model dir for the 'fused' arm (default: env QWEN3_FUSED_DIR or "
+                         "/tmp/qwen3-work/qwen35-0.8b-int8-fused)")
+    ap.add_argument("--label", default="fused",
+                    help="label to print for the fused arm (e.g. fused-light)")
     args = ap.parse_args()
+    if args.fused_dir:
+        os.environ["QWEN3_FUSED_DIR"] = args.fused_dir
 
     if args.worker:
         worker(args.mode, args.prompt_repeats, args.max_new_tokens)
@@ -187,14 +195,19 @@ def main():
         sys.exit(f"missing model dirs {ORIG} or {FUSED}")
 
     rows = []
+    label_for = {"unfused": "unfused", "fused": args.label}
     for mode in ["unfused", "fused"]:
-        print(f"\n  → {mode}  (repeats={args.prompt_repeats}, max_new={args.max_new_tokens})")
+        print(f"\n  → {label_for[mode]}  (repeats={args.prompt_repeats}, "
+              f"max_new={args.max_new_tokens})", flush=True)
+        if mode == "fused":
+            print(f"      fused dir: {FUSED}")
         cmd = [
             sys.executable, str(__file__), "--worker", "--mode", mode,
             "--prompt-repeats", str(args.prompt_repeats),
             "--max-new-tokens", str(args.max_new_tokens),
         ]
-        res = subprocess.run(cmd, capture_output=True, text=True)
+        sub_env = dict(os.environ)
+        res = subprocess.run(cmd, capture_output=True, text=True, env=sub_env)
         if res.returncode != 0:
             print(res.stdout); print(res.stderr)
             sys.exit(f"worker {mode} failed (exit {res.returncode})")
@@ -202,13 +215,14 @@ def main():
         rows.append(json.loads(line[len("@@RESULT@@ "):]))
 
     print("\n" + "=" * 124)
-    print(f"{'mode':<8s} {'load(s)':>8s} {'TTFT(s)':>8s} {'gen(s)':>8s} {'tok/s':>7s} "
+    print(f"{'mode':<12s} {'load(s)':>8s} {'TTFT(s)':>8s} {'gen(s)':>8s} {'tok/s':>7s} "
           f"{'loaded':>8s} {'warmed':>8s} {'pre_pk':>8s} {'dec_pk':>8s} {'peak':>8s} {'end':>8s} {'n_tok':>6s}")
     print("-" * 124)
     for r in rows:
         tok_s = f"{r['decode_tok_s']:.1f}" if r['decode_tok_s'] else "n/a"
         ttft = f"{r['ttft_s']:.2f}" if r['ttft_s'] else "n/a"
-        print(f"{r['mode']:<8s} "
+        display = label_for[r["mode"]]
+        print(f"{display:<12s} "
               f"{r['load_s']:>8.2f} {ttft:>8s} {r['generate_s']:>8.2f} {tok_s:>7s} "
               f"{r['rss_after_load_mb']:>8.0f} {r['rss_after_warmup_mb']:>8.0f} "
               f"{r['rss_prefill_peak_mb']:>8.0f} {r['rss_decode_peak_mb']:>8.0f} "
