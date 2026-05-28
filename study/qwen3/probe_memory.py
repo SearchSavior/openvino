@@ -28,6 +28,7 @@ import openvino as ov
 
 sys.path.insert(0, str(Path(__file__).parent))
 from fused_linear_attn import register, replace_gated_delta_rule_loops  # noqa: E402
+from lm_head_slice import slice_lm_head_to_last_token  # noqa: E402
 
 HIDDEN = 1024
 SAMPLE_INTERVAL_S = 0.010
@@ -131,6 +132,7 @@ def main():
     ap.add_argument("--model", default="/tmp/qwen3-work/qwen35-0.8b-int8/openvino_language_model.xml")
     ap.add_argument("--prompt-len", type=int, default=512)
     ap.add_argument("--fuse", action="store_true", help="apply fused-linear-attn rewrite")
+    ap.add_argument("--lm-head-slice", action="store_true", help="slice lm_head input to last token only")
     args = ap.parse_args()
 
     def snapshot(label):
@@ -142,7 +144,8 @@ def main():
               f"hblkhd(mmap)={fmt(mi['hblkhd'])}")
         return r
 
-    print(f"Model={args.model}  prompt_len={args.prompt_len}  fuse={args.fuse}")
+    print(f"Model={args.model}  prompt_len={args.prompt_len}  "
+          f"fuse_linear_attn={args.fuse}  lm_head_slice={args.lm_head_slice}")
     snapshot("process start")
 
     core = ov.Core()
@@ -152,6 +155,9 @@ def main():
     if args.fuse:
         n = replace_gated_delta_rule_loops(model)
         print(f"  → fused-linear-attn applied to {n} Loops")
+    if args.lm_head_slice:
+        ok = slice_lm_head_to_last_token(model)
+        print(f"  → lm_head_slice applied: {ok}")
     r_after_read = snapshot("after read_model")
 
     compiled = core.compile_model(model, "CPU", {
