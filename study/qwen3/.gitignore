@@ -1,3 +1,4 @@
 libqwen3_kernels.so
 __pycache__/
 *.pyc
+cpp_ext/build/
