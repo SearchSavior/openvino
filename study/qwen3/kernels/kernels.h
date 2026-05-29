@@ -69,6 +69,19 @@ void int8_sdpa_kernel(const float       *q,
                       float             *out,
                       int B, int H_q, int H_kv, int T_q, int T_full, int D);
 
+/* Process a slice of (b * H_q + h) indices in [bh_start, bh_end).
+ * Used by the cpp_ext path to parallelise via std::thread (no libgomp). */
+void int8_sdpa_kernel_slice(const float       *q,
+                            const signed char *k_data,
+                            const float       *k_scale,
+                            const signed char *v_data,
+                            const float       *v_scale,
+                            const float       *mask,
+                            float              scale,
+                            float             *out,
+                            int B, int H_q, int H_kv, int T_q, int T_full, int D,
+                            int bh_start, int bh_end);
+
 #ifdef __cplusplus
 }
 #endif

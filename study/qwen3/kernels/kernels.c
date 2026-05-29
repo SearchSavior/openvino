@@ -587,6 +587,84 @@ static inline float i8_f32_dot(const float *q, const signed char *k, int D)
 #endif
 }
 
+/* Core SDPA loop body: process a slice of (b, h) indices.
+ * Used both by the omp-parallel wrapper (Python/ctypes path) and by the
+ * std::thread wrapper in cpp_ext that splits work without libgomp. */
+void int8_sdpa_kernel_slice(
+    const float        * __restrict__ q,
+    const signed char  * __restrict__ k_data,
+    const float        * __restrict__ k_scale,
+    const signed char  * __restrict__ v_data,
+    const float        * __restrict__ v_scale,
+    const float        * __restrict__ mask,
+    float                              scale,
+    float              * __restrict__ out,
+    int B, int H_q, int H_kv, int T_q, int T_full, int D,
+    int bh_start, int bh_end)
+{
+    const int gqa = H_q / H_kv;
+    float scores[SDPA_TMAX];
+
+    for (int bh = bh_start; bh < bh_end; ++bh) {
+        const int b = bh / H_q;
+        const int h = bh % H_q;
+        const int h_kv = h / gqa;
+        const signed char *K  = k_data  + ((size_t)b*H_kv + h_kv) * (size_t)T_full * D;
+        const float       *Ks = k_scale + ((size_t)b*H_kv + h_kv) * (size_t)T_full;
+        const signed char *V  = v_data  + ((size_t)b*H_kv + h_kv) * (size_t)T_full * D;
+        const float       *Vs = v_scale + ((size_t)b*H_kv + h_kv) * (size_t)T_full;
+
+        for (int tq = 0; tq < T_q; ++tq) {
+            const float *q_row = q + (((size_t)b*H_q + h)*T_q + tq) * D;
+            float       *o_row = out + (((size_t)b*H_q + h)*T_q + tq) * D;
+            const float *m_row = mask
+                ? mask + ((size_t)b * T_q + tq) * (size_t)T_full
+                : NULL;
+
+            float max_s = -INFINITY;
+            for (int k = 0; k < T_full; ++k) {
+                float s = i8_f32_dot(q_row, K + (size_t)k * D, D);
+                s = s * Ks[k] * scale;
+                if (m_row) s += m_row[k];
+                scores[k] = s;
+                if (s > max_s) max_s = s;
+            }
+
+            float sum_e = 0.0f;
+            for (int k = 0; k < T_full; ++k) {
+                scores[k] = expf(scores[k] - max_s);
+                sum_e += scores[k];
+            }
+            const float inv_sum = 1.0f / sum_e;
+
+            for (int d = 0; d < D; ++d) o_row[d] = 0.0f;
+#if defined(__AVX512F__)
+            for (int k = 0; k < T_full; ++k) {
+                const float w = scores[k] * inv_sum * Vs[k];
+                const signed char *v_row = V + (size_t)k * D;
+                __m512 wv = _mm512_set1_ps(w);
+                int d = 0;
+                for (; d + 16 <= D; d += 16) {
+                    __m128i v8  = _mm_loadu_si128((const __m128i *)(v_row + d));
+                    __m512i vi  = _mm512_cvtepi8_epi32(v8);
+                    __m512  vf  = _mm512_cvtepi32_ps(vi);
+                    __m512  ov  = _mm512_loadu_ps(o_row + d);
+                    ov = _mm512_fmadd_ps(wv, vf, ov);
+                    _mm512_storeu_ps(o_row + d, ov);
+                }
+                for (; d < D; ++d) o_row[d] += w * (float)v_row[d];
+            }
+#else
+            for (int k = 0; k < T_full; ++k) {
+                const float w = scores[k] * inv_sum * Vs[k];
+                const signed char *v_row = V + (size_t)k * D;
+                for (int d = 0; d < D; ++d) o_row[d] += w * (float)v_row[d];
+            }
+#endif
+        }
+    }
+}
+
 void int8_sdpa_kernel(
     const float        * __restrict__ q,
     const signed char  * __restrict__ k_data,
@@ -602,73 +680,12 @@ void int8_sdpa_kernel(
 #ifdef _OPENMP
     if (omp_get_max_threads() < 4) omp_set_num_threads(4);
 #endif
-    const int gqa = H_q / H_kv;
 
-    #pragma omp parallel
-    {
-        float scores[SDPA_TMAX];
-
-        #pragma omp for collapse(2) schedule(static)
-        for (int b = 0; b < B; ++b) {
-            for (int h = 0; h < H_q; ++h) {
-                const int h_kv = h / gqa;
-                const signed char *K  = k_data  + ((size_t)b*H_kv + h_kv) * (size_t)T_full * D;
-                const float       *Ks = k_scale + ((size_t)b*H_kv + h_kv) * (size_t)T_full;
-                const signed char *V  = v_data  + ((size_t)b*H_kv + h_kv) * (size_t)T_full * D;
-                const float       *Vs = v_scale + ((size_t)b*H_kv + h_kv) * (size_t)T_full;
-
-                for (int tq = 0; tq < T_q; ++tq) {
-                    const float *q_row = q + (((size_t)b*H_q + h)*T_q + tq) * D;
-                    float       *o_row = out + (((size_t)b*H_q + h)*T_q + tq) * D;
-                    const float *m_row = mask
-                        ? mask + ((size_t)b * T_q + tq) * (size_t)T_full
-                        : NULL;
-
-                    /* Scores: scale * (q . dequant(K[k])) + mask. */
-                    float max_s = -INFINITY;
-                    for (int k = 0; k < T_full; ++k) {
-                        float s = i8_f32_dot(q_row, K + (size_t)k * D, D);
-                        s = s * Ks[k] * scale;
-                        if (m_row) s += m_row[k];
-                        scores[k] = s;
-                        if (s > max_s) max_s = s;
-                    }
-
-                    /* Softmax. */
-                    float sum_e = 0.0f;
-                    for (int k = 0; k < T_full; ++k) {
-                        scores[k] = expf(scores[k] - max_s);
-                        sum_e += scores[k];
-                    }
-                    const float inv_sum = 1.0f / sum_e;
-
-                    /* out = sum_k softmax[k] * dequant(V[k]). */
-                    for (int d = 0; d < D; ++d) o_row[d] = 0.0f;
-#if defined(__AVX512F__)
-                    for (int k = 0; k < T_full; ++k) {
-                        const float w = scores[k] * inv_sum * Vs[k];
-                        const signed char *v_row = V + (size_t)k * D;
-                        __m512 wv = _mm512_set1_ps(w);
-                        int d = 0;
-                        for (; d + 16 <= D; d += 16) {
-                            __m128i v8  = _mm_loadu_si128((const __m128i *)(v_row + d));
-                            __m512i vi  = _mm512_cvtepi8_epi32(v8);
-                            __m512  vf  = _mm512_cvtepi32_ps(vi);
-                            __m512  ov  = _mm512_loadu_ps(o_row + d);
-                            ov = _mm512_fmadd_ps(wv, vf, ov);
-                            _mm512_storeu_ps(o_row + d, ov);
-                        }
-                        for (; d < D; ++d) o_row[d] += w * (float)v_row[d];
-                    }
-#else
-                    for (int k = 0; k < T_full; ++k) {
-                        const float w = scores[k] * inv_sum * Vs[k];
-                        const signed char *v_row = V + (size_t)k * D;
-                        for (int d = 0; d < D; ++d) o_row[d] += w * (float)v_row[d];
-                    }
-#endif
-                }
-            }
-        }
+    const int total_bh = B * H_q;
+    #pragma omp parallel for schedule(static)
+    for (int bh = 0; bh < total_bh; ++bh) {
+        int8_sdpa_kernel_slice(q, k_data, k_scale, v_data, v_scale, mask,
+                               scale, out, B, H_q, H_kv, T_q, T_full, D,
+                               bh, bh + 1);
     }
 }

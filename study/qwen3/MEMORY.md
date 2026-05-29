@@ -190,7 +190,48 @@ is identical to the f32 baseline ("I am Qwen3.5, the latest large language
 model developed by Tongyi Lab. I am a text-based AI model, which means I
 don't…").
 
-### Runtime cost honest take
+### Closing the decode gap with fused int8 SDPA
+
+The next iteration replaced the canonical "QuantizedKVCache (f32 dequant
+output) -> Unsqueeze -> Broadcast -> Reshape -> SDPA" chain with one fused
+op that consumes i8 K/V directly. The full [B, H, T_full, D] f32 dequant
+tensor is never materialised.
+
+New custom ops in `cpp_ext/`:
+- `QuantizedKVCacheUpdate` -- same kernel as `QuantizedKVCache` but skips
+  the f32 dequant (`qkv_kernel(..., full_f32=NULL)`). Outputs are just
+  `(data_i8, scale_f32)`.
+- `QuantizedInt8SDPA` -- scaled dot-product attention with i8 K/V.
+  `i8_f32_dot` AVX-512 inner loop, GQA handled internally via
+  `h_kv = h_q / gqa_factor`. No f32 buffer for K or V is ever materialised.
+
+Wiring lives in `kernels/quantized_int8_sdpa.py::replace_kv_with_int8_sdpa`.
+
+Build gotcha: `cpp_ext/CMakeLists.txt` had to *drop* libgomp. Mixing libgomp
+with OV's libtbb in the same process tanks baseline decode 5x (10.43 ->
+1.82 tok/s) even when no custom op is in the IR. The cpp_ext kernels are
+now parallelised via `std::thread` spawned per call instead. Python/ctypes
+kernels keep libgomp in their own .so (loaded outside the OV plugin
+process).
+
+### Measured pp512 + tg32 (chunk=128, INFERENCE_NUM_THREADS=4)
+
+| metric             | A. baseline f32 KV | B. int8 KV + f32 dequant | C. int8 KV + int8 SDPA |
+|--------------------|-------------------:|-------------------------:|-----------------------:|
+| pp512 duration     |             2.78s  |                  2.14s   |                20.68s  |
+| pp512 throughput   |        184 tok/s   |             239 tok/s    |          24.8 tok/s    |
+| **tg32 duration**  |             3.07s  |                  5.12s   |              **3.64s** |
+| **tg32 throughput**|     **10.43 tok/s**|              6.25 tok/s  |       **8.78 tok/s**   |
+| persistent state   |          32.4 MiB  |               22.9 MiB   |             22.9 MiB   |
+
+C cuts the decode gap to baseline from -40% (B) down to -16%, at the same
+22.9 MiB persistent state and identical generation. It pays for it on
+prefill: 184 -> 25 tok/s. Our scalar int8 SDPA kernel can't match the
+plugin's optimized blocked-GEMM SDPA at large T_q. Next steps: a
+persistent thread pool to amortise `std::thread` spawn, and a Flash-
+Attention-style tiled inner loop to compete on prefill.
+
+### Runtime cost (B alone, kept for context)
 
 The persistent state goal is met, but the **decode runtime is 3× slower**
 and **peak RSS is 2.7× higher** during decode. Two root causes:

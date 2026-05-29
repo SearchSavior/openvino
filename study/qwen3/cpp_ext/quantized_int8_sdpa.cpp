@@ -1,7 +1,10 @@
 #include "quantized_int8_sdpa.hpp"
 #include "kernels.h"
 
+#include <algorithm>
 #include <cmath>
+#include <thread>
+#include <vector>
 
 using namespace Qwen3Ext;
 
@@ -58,15 +61,41 @@ bool QuantizedInt8SDPA::evaluate(ov::TensorVector& outputs, const ov::TensorVect
     auto& out = outputs[0];
     out.set_shape({(size_t)B, (size_t)H_q, (size_t)T_q, (size_t)D});
 
-    int8_sdpa_kernel(
-        static_cast<const float*>      (q      .data()),
-        static_cast<const signed char*>(k_data .data()),
-        static_cast<const float*>      (k_scale.data()),
-        static_cast<const signed char*>(v_data .data()),
-        static_cast<const float*>      (v_scale.data()),
-        mask_ptr,
-        kq_scale,
-        static_cast<float*>            (out    .data()),
-        B, H_q, H_kv, T_q, T_full, D);
+    // cpp_ext is built without libgomp (TBB conflict). Parallelise the SDPA
+    // by splitting (b, h_q) across std::threads. Each thread runs the kernel
+    // slice for its (bh_start, bh_end) range and writes its own output rows.
+    const float       *qp  = static_cast<const float*>      (q      .data());
+    const signed char *kdp = static_cast<const signed char*>(k_data .data());
+    const float       *ksp = static_cast<const float*>      (k_scale.data());
+    const signed char *vdp = static_cast<const signed char*>(v_data .data());
+    const float       *vsp = static_cast<const float*>      (v_scale.data());
+    float             *op  = static_cast<float*>            (out    .data());
+
+    const int total_bh = B * H_q;
+    int n_threads = static_cast<int>(std::thread::hardware_concurrency());
+    if (n_threads < 1) n_threads = 1;
+    if (n_threads > total_bh) n_threads = total_bh;
+
+    if (n_threads <= 1) {
+        int8_sdpa_kernel_slice(qp, kdp, ksp, vdp, vsp, mask_ptr,
+                               kq_scale, op,
+                               B, H_q, H_kv, T_q, T_full, D,
+                               0, total_bh);
+    } else {
+        std::vector<std::thread> workers;
+        workers.reserve(n_threads);
+        int chunk = (total_bh + n_threads - 1) / n_threads;
+        for (int t = 0; t < n_threads; ++t) {
+            int s = t * chunk;
+            int e = std::min(s + chunk, total_bh);
+            if (s >= e) break;
+            workers.emplace_back([=]() {
+                int8_sdpa_kernel_slice(qp, kdp, ksp, vdp, vsp, mask_ptr,
+                                       kq_scale, op,
+                                       B, H_q, H_kv, T_q, T_full, D, s, e);
+            });
+        }
+        for (auto& th : workers) th.join();
+    }
     return true;
 }
