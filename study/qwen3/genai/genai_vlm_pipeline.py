@@ -23,7 +23,7 @@ import sys
 import time
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).parent))
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "kernels"))
 
 import numpy as np
 import openvino as ov
@@ -35,7 +35,7 @@ from lm_head_slice import slice_lm_head_to_last_token
 
 ORIG = Path("/tmp/qwen3-work/qwen35-0.8b-int8")
 FUSED = Path("/tmp/qwen3-work/qwen35-0.8b-int8-fused")
-SO_PATH = Path(__file__).parent / "cpp_ext/build/libqwen3_ov_ext.so"
+SO_PATH = Path(__file__).resolve().parent.parent / "cpp_ext/build/libqwen3_ov_ext.so"
 
 LM_FILES = {"openvino_language_model.xml", "openvino_language_model.bin"}
 

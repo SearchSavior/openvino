@@ -27,7 +27,7 @@ find_package(OpenVINO REQUIRED PATHS "${OpenVINO_DIR_PY}")
 find_package(OpenMP)
 
 set(SRC
-    kernels.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/../kernels/kernels.c
     gated_delta_rule.cpp
     fused_causal_conv1d.cpp
     ov_extension.cpp
@@ -40,7 +40,11 @@ set_target_properties(${TARGET_NAME} PROPERTIES PREFIX "lib")
 target_compile_options(${TARGET_NAME} PRIVATE
     -O3 -march=native -ffast-math -Wall -Wextra)
 
-target_include_directories(${TARGET_NAME} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+# kernels.c / kernels.h are the canonical copies under ../kernels (shared with
+# the Python ctypes path). cpp_ext compiles them directly into the extension.
+target_include_directories(${TARGET_NAME} PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/../kernels)
 target_link_libraries(${TARGET_NAME} PRIVATE openvino::runtime)
 if(OpenMP_CXX_FOUND)
     target_link_libraries(${TARGET_NAME} PRIVATE OpenMP::OpenMP_C OpenMP::OpenMP_CXX)

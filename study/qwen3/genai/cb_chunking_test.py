@@ -33,7 +33,7 @@ import time
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
-SO = HERE / "cpp_ext/build/libqwen3_ov_ext.so"
+SO = HERE.parent / "cpp_ext/build/libqwen3_ov_ext.so"
 IR_DIRS = {
     "unfused": "/tmp/qwen3-work/qwen35-0.8b-int8",
     "slice-only": "/tmp/qwen3-work/qwen35-0.8b-int8-slice-only",

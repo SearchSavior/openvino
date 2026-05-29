@@ -12,7 +12,8 @@ that claim by reading the actual state tensors via query_state().
 """
 import sys, time
 from collections import defaultdict
-sys.path.insert(0, "/home/user/openvino/study/qwen3")
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "kernels"))
 import numpy as np
 import openvino as ov
 from transformers import AutoTokenizer

@@ -37,7 +37,7 @@ from pathlib import Path
 import numpy as np
 
 HERE = Path(__file__).resolve().parent
-SO = HERE / "cpp_ext/build/libqwen3_ov_ext.so"
+SO = HERE.parent / "cpp_ext/build/libqwen3_ov_ext.so"
 ORIG_XML = "/tmp/qwen3-work/qwen35-0.8b-int8/openvino_language_model.xml"
 # fused XML path is overridable so we can profile fused-light (no conv1d) too.
 FUSED_XML = os.environ.get(

@@ -1,6 +1,7 @@
 """Generate from Qwen3.5-VL LM with all three fusions applied, greedy decode."""
 import sys, time
-sys.path.insert(0, "/home/user/openvino/study/qwen3")
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "kernels"))
 import numpy as np
 import openvino as ov
 from transformers import AutoTokenizer

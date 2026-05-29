@@ -18,7 +18,7 @@ from pathlib import Path
 import numpy as np
 import openvino as ov
 
-sys.path.insert(0, str(Path(__file__).parent))
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "kernels"))
 from fused_linear_attn import register, replace_gated_delta_rule_loops  # noqa: E402
 
 HIDDEN = 1024

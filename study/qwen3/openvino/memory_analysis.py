@@ -58,7 +58,7 @@ from pathlib import Path
 import numpy as np
 
 HERE = Path(__file__).resolve().parent
-SO = HERE / "cpp_ext/build/libqwen3_ov_ext.so"
+SO = HERE.parent / "cpp_ext/build/libqwen3_ov_ext.so"
 ORIG_XML = "/tmp/qwen3-work/qwen35-0.8b-int8/openvino_language_model.xml"
 FUSED_XML = "/tmp/qwen3-work/qwen35-0.8b-int8-fused/openvino_language_model.xml"
 
