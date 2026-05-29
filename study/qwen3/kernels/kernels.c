@@ -197,25 +197,6 @@ void conv1d_kernel(
 }
 
 
-/* ---------------------------------------------------------------------------
- * qmm_kernel — dequant-on-the-fly int8 matmul, transpose_b semantics.
- *
- *   act        [M, K]            fp32
- *   u8         [N, K]            uint8
- *   scale      [N]               fp16 (cast inside)
- *   zp         [N]               uint8
- *   out        [M, N]            fp32
- *
- *   y[m, n] = scale[n] * (sum_k act[m, k] * (float)u8[n, k] - zp[n] * sum_k act[m, k])
- *
- * No bf16/f32 weight buffer is ever materialised. Per output row we read
- * K bytes of u8 directly from the IR Constant (file-backed) plus 4 bytes
- * scale + 1 byte zp.
- *
- * Parallelism: outer loop over N (output cols). Inner loop is K reductions.
- * For each m we precompute sum_k act[m, k].
- * --------------------------------------------------------------------------- */
-
 /* fp16 (binary16) -> fp32. Avoids depending on _Float16 / __fp16 by reading
  * the raw bits. Matches IEEE 754 half precision. */
 static inline float f16_to_f32(unsigned short h)
@@ -323,3 +304,116 @@ void qmm_kernel(
 #endif
     free(act_sum);
 }
+
+
+/* ---------------------------------------------------------------------------
+ * qmm_kernel_vnni — same external semantics as qmm_kernel, but uses VNNI
+ * `vpdpbusd` for the inner u8 * i8 -> i32 dot product.
+ *
+ * Per call we quantise each activation row to signed i8 (per-row symmetric):
+ *     s_m       = max(|act[m, :]|) / 127
+ *     act_i8[m, k] = round(act[m, k] / s_m)
+ *     act_sum_i32[m] = sum_k act_i8[m, k]
+ *
+ * Then for each (m, n):
+ *     i32_dot = sum_k act_i8[m, k] * u8[n, k]          # via vpdpbusd
+ *     y[m, n] = s_m * scale_w[n] * (i32_dot - zp[n] * act_sum_i32[m])
+ *
+ * Storage during the call: act_i8 [M, K] bytes + small per-row scalars.
+ * The (B, B) bf16 weight cache is still NOT materialised.
+ * --------------------------------------------------------------------------- */
+#if defined(__AVX512VNNI__)
+void qmm_kernel_vnni(
+    const float * __restrict__ act,
+    const unsigned char * __restrict__ u8,
+    const unsigned short * __restrict__ scale,
+    const unsigned char * __restrict__ zp,
+    float       * __restrict__ out,
+    int M, int N, int K)
+{
+    qmm_unpin_self();
+#ifdef _OPENMP
+    if (omp_get_max_threads() < 4) omp_set_num_threads(4);
+#endif
+
+    /* Per-row activation quantisation. */
+    signed char *act_i8 = (signed char *)aligned_alloc(64, (size_t)M * (size_t)K);
+    float *act_scale = (float *)malloc(sizeof(float) * (size_t)M);
+    int   *act_sum_i8 = (int   *)malloc(sizeof(int)   * (size_t)M);
+
+    #pragma omp parallel for schedule(static)
+    for (int m = 0; m < M; ++m) {
+        const float *a_m = act + (size_t)m * K;
+        /* max(|.|) via AVX-512 */
+        __m512 vmax = _mm512_setzero_ps();
+        const __m512 abs_mask = _mm512_castsi512_ps(_mm512_set1_epi32(0x7fffffff));
+        int k = 0;
+        for (; k + 16 <= K; k += 16) {
+            __m512 v = _mm512_loadu_ps(a_m + k);
+            v = _mm512_and_ps(v, abs_mask);
+            vmax = _mm512_max_ps(vmax, v);
+        }
+        float max_abs = _mm512_reduce_max_ps(vmax);
+        for (; k < K; ++k) {
+            float ax = a_m[k]; if (ax < 0) ax = -ax;
+            if (ax > max_abs) max_abs = ax;
+        }
+        float s = (max_abs > 0.0f) ? max_abs / 127.0f : 1.0f;
+        float inv = (max_abs > 0.0f) ? 127.0f / max_abs : 0.0f;
+        act_scale[m] = s;
+
+        signed char *row = act_i8 + (size_t)m * K;
+        int sum = 0;
+        __m512i sum_v = _mm512_setzero_si512();
+        const __m512 inv_v = _mm512_set1_ps(inv);
+        k = 0;
+        for (; k + 16 <= K; k += 16) {
+            __m512 v = _mm512_loadu_ps(a_m + k);
+            v = _mm512_mul_ps(v, inv_v);
+            __m512i q = _mm512_cvtps_epi32(v);             /* rounds-to-nearest */
+            /* clamp [-128, 127] */
+            q = _mm512_max_epi32(q, _mm512_set1_epi32(-128));
+            q = _mm512_min_epi32(q, _mm512_set1_epi32(127));
+            /* sum and pack to i8 */
+            sum_v = _mm512_add_epi32(sum_v, q);
+            __m128i q8 = _mm512_cvtepi32_epi8(q);
+            _mm_storeu_si128((__m128i *)(row + k), q8);
+        }
+        sum += _mm512_reduce_add_epi32(sum_v);
+        for (; k < K; ++k) {
+            int q = (int)lrintf(a_m[k] * inv);
+            if (q > 127) q = 127; if (q < -128) q = -128;
+            row[k] = (signed char)q;
+            sum += q;
+        }
+        act_sum_i8[m] = sum;
+    }
+
+    /* Matmul using vpdpbusd: u8 * i8 -> i32 accumulator. */
+    #pragma omp parallel for schedule(static)
+    for (int n = 0; n < N; ++n) {
+        const unsigned char *w_n = u8 + (size_t)n * K;
+        const float sc_n = f16_to_f32(scale[n]);
+        const float zp_n = (float)zp[n];
+        for (int m = 0; m < M; ++m) {
+            const signed char *a_i8 = act_i8 + (size_t)m * K;
+            __m512i acc = _mm512_setzero_si512();
+            int k = 0;
+            for (; k + 64 <= K; k += 64) {
+                __m512i zw = _mm512_loadu_si512((const __m512i *)(w_n + k));
+                __m512i za = _mm512_loadu_si512((const __m512i *)(a_i8 + k));
+                acc = _mm512_dpbusd_epi32(acc, zw, za);
+            }
+            int dot = _mm512_reduce_add_epi32(acc);
+            for (; k < K; ++k) dot += (int)w_n[k] * (int)a_i8[k];
+
+            float dot_f = (float)dot - zp_n * (float)act_sum_i8[m];
+            out[(size_t)m * N + n] = act_scale[m] * sc_n * dot_f;
+        }
+    }
+
+    free(act_i8);
+    free(act_scale);
+    free(act_sum_i8);
+}
+#endif  /* __AVX512VNNI__ */

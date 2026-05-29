@@ -50,6 +50,9 @@ def get_lib() -> ctypes.CDLL:
             ctypes.c_void_p,                                       # out
             ctypes.c_int, ctypes.c_int, ctypes.c_int,              # M, N, K
         ]
+        if hasattr(lib, "qmm_kernel_vnni"):
+            lib.qmm_kernel_vnni.restype = None
+            lib.qmm_kernel_vnni.argtypes = lib.qmm_kernel.argtypes
         _lib = lib
     return _lib
 
@@ -76,8 +79,14 @@ def gdr(q, k, v, g, beta, S, out):
     )
 
 
+def use_vnni() -> bool:
+    return os.environ.get("QWEN3_USE_VNNI", "0") == "1"
+
+
 def qmm(act, u8, scale, zp, out):
-    """In-place: writes out. act, scale (f16 bits), zp (u8), u8 must be C-contiguous."""
+    """In-place: writes out. act, scale (f16 bits), zp (u8), u8 must be C-contiguous.
+    If QWEN3_USE_VNNI=1 and the kernel has VNNI support, dispatches to qmm_kernel_vnni.
+    """
     assert act.dtype == np.float32 and act.flags["C_CONTIGUOUS"]
     assert u8.dtype == np.uint8 and u8.flags["C_CONTIGUOUS"]
     assert scale.dtype == np.uint16 and scale.flags["C_CONTIGUOUS"]
@@ -90,9 +99,10 @@ def qmm(act, u8, scale, zp, out):
     assert scale.shape[0] == N, f"scale.shape={scale.shape} != N={N}"
     assert zp.shape[0] == N, f"zp.shape={zp.shape} != N={N}"
     lib = get_lib()
-    lib.qmm_kernel(act.ctypes.data, u8.ctypes.data,
-                   scale.ctypes.data, zp.ctypes.data,
-                   out.ctypes.data, M, N, K)
+    fn = lib.qmm_kernel_vnni if (use_vnni() and hasattr(lib, "qmm_kernel_vnni")) else lib.qmm_kernel
+    fn(act.ctypes.data, u8.ctypes.data,
+       scale.ctypes.data, zp.ctypes.data,
+       out.ctypes.data, M, N, K)
 
 
 def conv1d(prev, cur, w, out, new_state):

@@ -21,6 +21,14 @@ void qmm_kernel(const float *act,
                 float *out,
                 int M, int N, int K);
 
+/* AVX-512 VNNI variant: per-row quantises act to i8 and uses vpdpbusd. */
+void qmm_kernel_vnni(const float *act,
+                     const unsigned char *u8,
+                     const unsigned short *scale,
+                     const unsigned char *zp,
+                     float *out,
+                     int M, int N, int K);
+
 #ifdef __cplusplus
 }
 #endif

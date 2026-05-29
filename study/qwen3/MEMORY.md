@@ -55,17 +55,19 @@ Plus a graph-only rewrite, [`lm_head_slice`](kernels/lm_head_slice.py): insert
 |-------------------------|---------:|-------:|--------:|---------------:|
 | stock IR (no fusions)   |  ~3.8 GB |     — |     —   |     —          |
 | + gdr + conv + slice (qmm=none) | 2052 MB |     —    |  14.4s |  0.45s |
-| + qmm=lm_head           |    **1807 MB** |  **−245 MB** |  **11.5s** | 0.49s |
-| + qmm=all (187 matmuls) |    **1335 MB** |  **−717 MB** |   40.7s | 1.11s |
+| + qmm=lm_head           |    1807 MB |  −245 MB |  **11.5s** | 0.49s |
+| + qmm=all, FMA inner loop |  1335 MB |  −717 MB |   40.7s | 1.13s |
+| + qmm=all, **VNNI** (`QWEN3_USE_VNNI=1`) | **1335 MB** | **−717 MB** | **19.2s** | 0.95s |
 
-`qmm=lm_head` is both lower memory and slightly faster than baseline: it
-saves both the plugin's 245 MB lm_head bf16 expansion at first infer and
-the time spent doing that expansion.
+`qmm=lm_head` is strictly better than baseline: lower memory AND faster
+prefill (it saves both the plugin's 245 MB lm_head bf16 expansion at first
+infer and the time spent doing that expansion).
 
-`qmm=all` is the memory ceiling. At 1335 MB we are within ~300 MB of
-llama.cpp's q8_0 footprint. The remaining 3× prefill slowdown vs baseline is
-the cost of our AVX-512 f32 inner loop competing with the plugin's bf16/int8
-GEMM with full BLAS-style blocking — VNNI int8 dot would close that gap.
+`qmm=all + VNNI` is the memory ceiling at 1335 MB — within ~300 MB of
+llama.cpp's q8_0 footprint — at only 1.34× the baseline prefill time. The
+i8 activation quantisation introduces ~0.7 % relative error per matmul but
+preserves coherent generation end-to-end ("As an AI, I don't have a physical
+body, so I don't have a show size in the traditional sense...").
 
 Persistent state at 2048 tokens (fp32, unchanged across configs): 67.8 MB
 (48 full-attn KV + 18 linear-attn state + 1.7 conv state).
@@ -112,6 +114,15 @@ tokens → 48.0 MB at 2048. At fp32 that is 4× the q8_0 llama.cpp reference
      kernel restores fan-out. Verified with `taskset -c 0` standalone: 60 ms
      pinned vs 14 ms unpinned, matching the in-OV gap exactly.
 
+5. **AVX-512 VNNI inner loop (`qmm_kernel_vnni`).** Per-call symmetric
+   quantisation of the activation row to i8 (per-row scale = max|act|/127),
+   then `vpdpbusd` for u8·i8 → i32 dot products. The factored math
+   `y = s_m * s_w * (i32_dot − zp_w * sum(act_i8))` lets `sum(act_i8)` be
+   precomputed once per row and reused. Standalone speedups vs the FMA
+   inner loop: 1.7× on lm_head (M=1), 4–8× on the bigger prefill matmuls
+   (M=256, N≥1024). In OV: `qmm=all` prefill 40.7s → 19.2s. Enabled via
+   `QWEN3_USE_VNNI=1` (kept opt-in because of the i8-quant accuracy hit).
+
 ## What did not work
 
 - **`KV_CACHE_PRECISION` hint is inert here.** u8 vs default gives
@@ -135,14 +146,11 @@ tokens → 48.0 MB at 2048. At fp32 that is 4× the q8_0 llama.cpp reference
 
 ## Next steps (ordered by expected payoff)
 
-1. **VNNI `vpdpbusd` inner loop.** The CPU has `avx512_vnni`; using it for
-   u8·i8 → i32 dot would 4× our int8 throughput and bring `qmm=all` close to
-   baseline speed. Requires quantizing the activation row to i8 per call
-   (llama.cpp-style q8_0 act-quant) and applying scale/zp correction at the
-   end. Big work but the right architecture.
-2. **Quantize the full-attn KV cache** to u8 in a custom KV op (48 → ~12 MB,
+1. **Quantize the full-attn KV cache** to u8 in a custom KV op (48 → ~12 MB,
    saves ~36 MB). The only path to KV parity with llama.cpp on this IR.
-3. fp16 recurrent + conv state (18 → ~9 MB) — small, low risk.
+2. fp16 recurrent + conv state (18 → ~9 MB) — small, low risk.
+3. Activation quantisation group-of-K (q8_0-style with K=32) instead of
+   per-row, to claw back the ~0.7 % VNNI error and make it the default.
 
 ## Reproduce
 
@@ -152,8 +160,10 @@ cd study/qwen3
 QWEN3_USE_C=1 python openvino/lowmem_infer.py --seq 2048 --chunk 128
 # Streaming int8 lm_head (the practical sweet spot)
 QWEN3_USE_C=1 python openvino/lowmem_infer.py --seq 2048 --chunk 128 --qmm lm_head
-# Memory ceiling (slow)
+# Full streaming int8, scalar FMA inner loop
 QWEN3_USE_C=1 python openvino/lowmem_infer.py --seq 2048 --chunk 128 --qmm all
+# Full streaming int8 with VNNI vpdpbusd
+QWEN3_USE_C=1 QWEN3_USE_VNNI=1 python openvino/lowmem_infer.py --seq 2048 --chunk 128 --qmm all
 # End-to-end generation (verify correctness)
 QWEN3_USE_C=1 python openvino/generate.py
 ```
