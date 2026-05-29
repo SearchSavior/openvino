@@ -15,9 +15,33 @@
 #include <stdlib.h>
 #include <string.h>
 
+#if defined(__AVX512F__)
+#include <immintrin.h>
+#endif
+
 #ifdef _OPENMP
 #include <omp.h>
 #endif
+#include <stdio.h>
+
+/* Reset CPU affinity to all available CPUs. OV's plugin pins the calling
+ * thread to a single CPU via TBB; without this, our omp fork inherits the
+ * single-CPU affinity and serialises. _GNU_SOURCE must be defined before
+ * <sched.h> to expose CPU_SET / cpu_set_t. */
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE
+#endif
+#include <sched.h>
+#include <unistd.h>
+static void qmm_unpin_self(void)
+{
+    cpu_set_t cs;
+    CPU_ZERO(&cs);
+    long n = sysconf(_SC_NPROCESSORS_ONLN);
+    if (n <= 0) n = 4;
+    for (long i = 0; i < n; ++i) CPU_SET(i, &cs);
+    sched_setaffinity(0, sizeof(cs), &cs);
+}
 
 /* ---------------------------------------------------------------------------
  * gdr_kernel — gated delta rule recurrence.
@@ -225,8 +249,14 @@ void qmm_kernel(
     float       * __restrict__ out,
     int M, int N, int K)
 {
-    /* Precompute sum_k act[m, k] for each m. */
-    /* For typical M up to a few thousand this fits on stack. Use heap if big. */
+    /* OV's plugin runs Op.evaluate() inside a TBB worker pinned to one CPU.
+     * Reset affinity so our omp threads can spread across the 4 cores. */
+    qmm_unpin_self();
+#ifdef _OPENMP
+    if (omp_get_max_threads() < 4) omp_set_num_threads(4);
+#endif
+
+    /* Precompute sum_k act[m, k] for each m. SIMD-vectorisable directly. */
     float *act_sum = (float *)malloc(sizeof(float) * (size_t)M);
     for (int m = 0; m < M; ++m) {
         const float *a_m = act + (size_t)m * K;
@@ -235,6 +265,49 @@ void qmm_kernel(
         act_sum[m] = s;
     }
 
+#if defined(__AVX512F__)
+    /* Per-thread scratch for the dequantised weight row.
+     * Max K in this model is 3584 (MLP down_proj); 4096 leaves headroom. */
+    #define QMM_KMAX 4096
+    #pragma omp parallel
+    {
+        float w_f[QMM_KMAX] __attribute__((aligned(64)));
+
+        #pragma omp for schedule(static)
+        for (int n = 0; n < N; ++n) {
+            const unsigned char *w_n = u8 + (size_t)n * K;
+            const float sc_n = f16_to_f32(scale[n]);
+            const float zp_n = (float)zp[n];
+
+            /* Dequant w_n into stack scratch (u8 -> f32, no zp/scale here;
+             * those fold into the factored math below). */
+            int k = 0;
+            for (; k + 16 <= K; k += 16) {
+                __m128i u = _mm_loadu_si128((const __m128i *)(w_n + k));
+                __m512i i = _mm512_cvtepu8_epi32(u);
+                __m512  f = _mm512_cvtepi32_ps(i);
+                _mm512_store_ps(w_f + k, f);
+            }
+            for (; k < K; ++k) w_f[k] = (float)w_n[k];
+
+            /* M dot products against the same dequanted row. */
+            for (int m = 0; m < M; ++m) {
+                const float *a_m = act + (size_t)m * K;
+                __m512 acc = _mm512_setzero_ps();
+                int kk = 0;
+                for (; kk + 16 <= K; kk += 16) {
+                    __m512 av = _mm512_loadu_ps(a_m + kk);
+                    __m512 wv = _mm512_load_ps(w_f + kk);
+                    acc = _mm512_fmadd_ps(av, wv, acc);
+                }
+                float dot = _mm512_reduce_add_ps(acc);
+                for (; kk < K; ++kk) dot += a_m[kk] * w_f[kk];
+
+                out[(size_t)m * N + n] = sc_n * (dot - zp_n * act_sum[m]);
+            }
+        }
+    }
+#else
     #pragma omp parallel for schedule(static)
     for (int n = 0; n < N; ++n) {
         const unsigned char *w_n = u8 + (size_t)n * K;
@@ -243,11 +316,10 @@ void qmm_kernel(
         for (int m = 0; m < M; ++m) {
             const float *a_m = act + (size_t)m * K;
             float dot = 0.0f;
-            for (int k = 0; k < K; ++k) {
-                dot += a_m[k] * (float)w_n[k];
-            }
+            for (int k = 0; k < K; ++k) dot += a_m[k] * (float)w_n[k];
             out[(size_t)m * N + n] = sc_n * (dot - zp_n * act_sum[m]);
         }
     }
+#endif
     free(act_sum);
 }

@@ -62,10 +62,10 @@ class QuantizedMatMul(Op):
         return True
 
     def evaluate(self, outputs, inputs):
-        act = np.asarray(inputs[0].data)           # [..., K] f32
-        u8  = np.asarray(inputs[1].data)           # [N, K]   u8
-        sc  = np.asarray(inputs[2].data)           # [N, 1]   f16
-        zp  = np.asarray(inputs[3].data)           # [N, 1]   u8
+        act = np.asarray(inputs[0].data)
+        u8  = np.asarray(inputs[1].data)
+        sc  = np.asarray(inputs[2].data)
+        zp  = np.asarray(inputs[3].data)
 
         K = act.shape[-1]
         N = u8.shape[0]
@@ -73,9 +73,8 @@ class QuantizedMatMul(Op):
         outputs[0].shape = tuple(out_shape)
         out = np.asarray(outputs[0].data)
 
-        # Flatten leading dims so act is [M, K]; reshape result at end.
         act_flat = np.ascontiguousarray(act.reshape(-1, K), dtype=np.float32)
-        out_flat = out.reshape(-1, N)             # [M, N] f32
+        out_flat = out.reshape(-1, N)
 
         if _use_c():
             sc_view = sc.reshape(-1)

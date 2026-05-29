@@ -51,12 +51,24 @@ Plus a graph-only rewrite, [`lm_head_slice`](kernels/lm_head_slice.py): insert
 
 ## Measured — seq = 2048, chunk = 128
 
-| config                  | peak RSS | Δ vs baseline | prefill | persistent state |
-|-------------------------|---------:|--------------:|--------:|-----------------:|
-| stock IR (no fusions)   |  ~3.8 GB |             — |     —   |             —    |
-| + all 4 rewrites, qmm=none      | 2051 MB |              — |  11.2s  |    67.9 MB |
-| + qmm=lm_head only      |    **1805 MB** |   **−246 MB** |  11.7s  |    67.9 MB |
-| + qmm=all (187 matmuls) |    **1332 MB** |   **−719 MB** |    112s |    67.9 MB |
+| config                  | peak RSS | Δ peak | prefill | decode (4 tok) |
+|-------------------------|---------:|-------:|--------:|---------------:|
+| stock IR (no fusions)   |  ~3.8 GB |     — |     —   |     —          |
+| + gdr + conv + slice (qmm=none) | 2052 MB |     —    |  14.4s |  0.45s |
+| + qmm=lm_head           |    **1807 MB** |  **−245 MB** |  **11.5s** | 0.49s |
+| + qmm=all (187 matmuls) |    **1335 MB** |  **−717 MB** |   40.7s | 1.11s |
+
+`qmm=lm_head` is both lower memory and slightly faster than baseline: it
+saves both the plugin's 245 MB lm_head bf16 expansion at first infer and
+the time spent doing that expansion.
+
+`qmm=all` is the memory ceiling. At 1335 MB we are within ~300 MB of
+llama.cpp's q8_0 footprint. The remaining 3× prefill slowdown vs baseline is
+the cost of our AVX-512 f32 inner loop competing with the plugin's bf16/int8
+GEMM with full BLAS-style blocking — VNNI int8 dot would close that gap.
+
+Persistent state at 2048 tokens (fp32, unchanged across configs): 67.8 MB
+(48 full-attn KV + 18 linear-attn state + 1.7 conv state).
 
 After compile, before first infer: 166 MB RSS (qmm=none/lm_head) or 154 MB
 (qmm=all — the smaller graph drops some plugin scratch).
@@ -83,10 +95,22 @@ tokens → 48.0 MB at 2048. At fp32 that is 4× the q8_0 llama.cpp reference
    state carry across chunks for free; the full-attn KV grows in the
    infer_request.
 3. **`QuantizedMatMul` streaming dequant** — eliminates the plugin's bf16
-   weight repack. lm_head alone is 242 MB u8 → ~485 MB bf16; killing that
-   single repack saves 246 MB at peak. The full sweep (`qmm=all`) saves
-   719 MB but is 10× slower at prefill (the C kernel is a straight scalar
-   loop, no VNNI/AVX-512 int8 dot product — the right speedup target).
+   weight repack. lm_head alone is 242 MB u8 → ~245 MB bf16 in the plugin
+   cache; killing that single repack saves 245 MB at peak. The full sweep
+   (`qmm=all`) saves 717 MB at the cost of 3× prefill time vs baseline.
+
+4. **Hand-rolled AVX-512 inner loop + affinity reset.** Initial scalar QMM
+   was 10× slower than the plugin (qmm=all 112s prefill). Two fixes brought
+   it to 2.75× slower (40.7s):
+   - The k-loop now does 16-lane f32 FMAs with the u8 weight converted via
+     `_mm_loadu_si128` + `_mm512_cvtepu8_epi32` + `_mm512_cvtepi32_ps`.
+     Per-row dequant is written once into 4 KB stack scratch, then M dot
+     products reuse it.
+   - OV's plugin runs Op.evaluate inside a TBB worker pinned to one CPU. Our
+     `#pragma omp parallel` inherited that affinity, so all 4 omp threads ran
+     on the same core. `sched_setaffinity(0, all_cpus)` at the top of the
+     kernel restores fan-out. Verified with `taskset -c 0` standalone: 60 ms
+     pinned vs 14 ms unpinned, matching the in-OV gap exactly.
 
 ## What did not work
 
@@ -111,10 +135,13 @@ tokens → 48.0 MB at 2048. At fp32 that is 4× the q8_0 llama.cpp reference
 
 ## Next steps (ordered by expected payoff)
 
-1. **Quantize the full-attn KV cache** to u8 in a custom KV op (48 → ~12 MB,
+1. **VNNI `vpdpbusd` inner loop.** The CPU has `avx512_vnni`; using it for
+   u8·i8 → i32 dot would 4× our int8 throughput and bring `qmm=all` close to
+   baseline speed. Requires quantizing the activation row to i8 per call
+   (llama.cpp-style q8_0 act-quant) and applying scale/zp correction at the
+   end. Big work but the right architecture.
+2. **Quantize the full-attn KV cache** to u8 in a custom KV op (48 → ~12 MB,
    saves ~36 MB). The only path to KV parity with llama.cpp on this IR.
-2. **Speed up `QuantizedMatMul`** with AVX-512 VNNI int8 dot product, then
-   `qmm=all` becomes the default with no time penalty — saves ~700 MB.
 3. fp16 recurrent + conv state (18 → ~9 MB) — small, low risk.
 
 ## Reproduce
