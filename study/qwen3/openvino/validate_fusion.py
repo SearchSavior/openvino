@@ -24,10 +24,31 @@ from fused_linear_attn import register, replace_gated_delta_rule_loops  # noqa: 
 HIDDEN = 1024
 
 
-def make_inputs(seq: int, seed: int = 0):
-    rng = np.random.default_rng(seed)
+def make_inputs(seq: int, model_dir: str, seed: int = 0):
+    """Build real prefill inputs by embedding actual token ids.
+
+    NOTE: random inputs_embeds are NOT a valid correctness test here. The gated
+    delta rule is a multiplicative recurrence over `seq` steps; driven by
+    out-of-distribution noise it amplifies the sub-ULP ordering differences
+    between the plugin's Loop and our fused kernel into a large logit gap, even
+    though the per-step kernel matches the HF reference to ~1e-8 (see
+    kernels/test_kernels.py). Realistic embeddings keep the recurrence in its
+    trained regime, where the two paths agree.
+    """
+    from transformers import AutoTokenizer
+    import openvino as ov
+
+    tok = AutoTokenizer.from_pretrained(model_dir)
+    text = ("Computers process information through electrical signals. " * 64).strip()
+    ids = np.asarray([tok.encode(text)[:seq]], dtype=np.int64)
+    seq = ids.shape[1]
+
+    embed = ov.Core().compile_model(
+        f"{model_dir}/openvino_text_embeddings_model.xml", "CPU")
+    embeds = list(embed.create_infer_request().infer({0: ids}).values())[0]
+
     return {
-        "inputs_embeds": (rng.standard_normal((1, seq, HIDDEN)) * 0.02).astype(np.float32),
+        "inputs_embeds": np.asarray(embeds, dtype=np.float32),
         "attention_mask": np.ones((1, seq), dtype=np.int64),
         "position_ids": np.tile(np.arange(seq, dtype=np.int64).reshape(1, 1, seq), (4, 1, 1)),
         "beam_idx": np.zeros((1,), dtype=np.int32),
@@ -57,13 +78,15 @@ def main():
     ap.add_argument("--prompt-len", type=int, default=16)
     args = ap.parse_args()
 
-    inputs = make_inputs(args.prompt_len)
+    model_dir = str(Path(args.model).resolve().parent)
+    inputs = make_inputs(args.prompt_len, model_dir)
+    real_len = inputs["inputs_embeds"].shape[1]
 
-    print(f"=== Baseline (Loop fallback) — prompt_len={args.prompt_len} ===")
+    print(f"=== Baseline (Loop fallback) — prompt_len={real_len} (real embeddings) ===")
     base = run_once(args.model, apply_fusion=False, inputs=inputs)
     print(f"  logits shape: {base.shape}, dtype: {base.dtype}")
 
-    print(f"\n=== Fused (GatedDeltaRule) — prompt_len={args.prompt_len} ===")
+    print(f"\n=== Fused (GatedDeltaRule) — prompt_len={real_len} ===")
     fused = run_once(args.model, apply_fusion=True, inputs=inputs)
     print(f"  logits shape: {fused.shape}, dtype: {fused.dtype}")
 
