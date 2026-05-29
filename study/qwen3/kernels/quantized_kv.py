@@ -227,12 +227,10 @@ def replace_kv_with_int8(model: ov.Model) -> int:
         qkv = QuantizedKVCache([rv_data_g.output(0), rv_scale_g.output(0), new_kv_src])
         qkv.set_friendly_name(concat.get_friendly_name() + "/QKV")
 
-        # Rewire ONLY the SDPA-side consumers of the old Concat (NOT the old
-        # Assign). The dead Assign stays connected to the old Concat which we
-        # will collapse to empty below.
+        # Rewire ALL consumers of the old Concat (SDPA chain *and* any ShapeOf
+        # that downstream Broadcasts use for their target-shape vector) to the
+        # QKV's f32 output. We later drop the dead Assign+ReadValue path.
         for consumer in list(concat.output(0).get_target_inputs()):
-            if consumer.get_node() is old_assign:
-                continue
             consumer.replace_source_output(qkv.output(0))
 
         # opset.assign only accepts single-output Node, not Output. Wrap the
@@ -243,39 +241,34 @@ def replace_kv_with_int8(model: ov.Model) -> int:
         new_asg_scale = ops.assign(scale_out, scale_var)
         model.add_sinks([new_asg_data, new_asg_scale])
 
-        # The old f32 ReadValue -> Gather -> Concat -> Assign chain still feeds
-        # the old Assign. OV requires every Variable to keep paired
-        # ReadValue+Assign and we can't remove either via the Python API.
-        # We shrink the dead state to 1/4 its size by mutating the old
-        # Variable's dtype f32 -> i8 and inserting Convert nodes so the dead
-        # path still type-checks:
-        #   Variable[i8] -> ReadValue -> Convert(f32) -> Gather -> Concat
-        #   Concat(f32) -> Convert(i8) -> Assign -> Variable[i8]
-        # We tried to collapse the dead chain entirely (empty Concat input,
-        # Variable shape [B, 2, 0, D]) but that triggers a downstream eltwise
-        # shape-inference mismatch in the SDPA GQA Broadcast at runtime --
-        # the dead Concat's output shape still participates in some shared
-        # shape-inference path even though it's not consumed by SDPA.
-        D = int(old_shape[3].get_length())
-
-        empty_i8_init = ops.constant(np.zeros((1, 2, 0, D), dtype=np.int8))
-        rv.input(0).replace_source_output(empty_i8_init.output(0))
-
-        dequant_dead = ops.convert(rv.output(0), ov.Type.f32)
-        for consumer in list(rv.output(0).get_target_inputs()):
-            if consumer.get_node() is dequant_dead:
+        # Detach the old f32 chain entirely.
+        #
+        # The IR computes the SDPA GQA Broadcast target T as
+        #     Add(ShapeOf(old_Gather)[2], N)        # = T_prev + N
+        # i.e. it reads the post-Gather *prev* tensor's T. With an empty f32
+        # stub plugged into the old Gather, ShapeOf would say T=0 even when
+        # the live path has T_prev>0, so the runtime Broadcast/Multiply
+        # mismatches the input data dim. Redirect those ShapeOf nodes to read
+        # from the new i8 Gather (`rv_data_g`) instead -- same T_prev, no
+        # dtype impact since ShapeOf ignores element type.
+        dead_chain_nodes = {rv}
+        if gather is not None:
+            dead_chain_nodes.add(gather)
+        dead_chain_nodes.add(concat)
+        for shape_node in list(model.get_ops()):
+            if shape_node.get_type_name() != "ShapeOf":
                 continue
-            consumer.replace_source_output(dequant_dead.output(0))
+            src = shape_node.input(0).get_source_output().get_node()
+            if src in dead_chain_nodes:
+                shape_node.input(0).replace_source_output(rv_data_g.output(0))
 
-        old_concat_out = old_assign.input(0).get_source_output()
-        requant_dead = ops.convert(old_concat_out, ov.Type.i8)
-        old_assign.input(0).replace_source_output(requant_dead.output(0))
+        D = int(old_shape[3].get_length())
+        empty_f32 = ops.constant(np.zeros((1, 2, 0, D), dtype=np.float32))
+        for consumer in list(rv.output(0).get_target_inputs()):
+            consumer.replace_source_output(empty_f32.output(0))
 
-        new_info = VariableInfo()
-        new_info.variable_id = old_info.variable_id
-        new_info.data_type = ov.Type.i8
-        new_info.data_shape = old_shape
-        old_var.update(new_info)
+        model.remove_sink(old_assign)
+        model.remove_variable(old_var)
 
         rewritten += 1
 

@@ -167,23 +167,68 @@ memory pass. As a workaround the old Variable is mutated `f32 -> i8` and
 Convert nodes bridge the dead chain, keeping its storage at 1/4 the bytes
 even though the dead Concat still grows with T.
 
-### Measured at T=2048 (chunk=128, real prompt embeddings)
+### Measured at pp2048 + tg512 (chunk=128, INFERENCE_NUM_THREADS=4)
 
-| state category            | OV f32 (stock) | OV int8 KV  |
-|---------------------------|---------------:|------------:|
-| `full_attn_kv_f32`        |   48.0 MiB     |     -       |
-| `full_attn_kv_i8` (dead)  |      -         |  12.0 MiB   |
-| `full_attn_kv_i8` (live)  |      -         |  12.0 MiB   |
-| `full_attn_scale_f32`     |      -         |   0.2 MiB   |
-| `linear_attn_state`       |   18.0 MiB     |  18.0 MiB   |
-| `conv1d_state`            |    1.7 MiB     |   1.7 MiB   |
-| **TOTAL persistent state**|  **67.8 MiB**  | **43.9 MiB** |
+| metric                  | f32 KV (baseline) |  int8 KV  | Δ |
+|-------------------------|------------------:|----------:|--:|
+| pp2048 duration         |             14.68s | **11.15s** | -3.5s   |
+| pp2048 throughput       |        139.5 tok/s | **183.7 tok/s** | +44 tok/s |
+| pp2048 peak RSS         |             2051 MB | 4287 MB   | +2.2 GB |
+| tg512 duration          |              53.4s | 154.0s    | +100s   |
+| tg512 throughput        |          9.59 tok/s | 3.33 tok/s | -6.3 tok/s |
+| tg512 peak RSS          |             2224 MB | 6036 MB   | +3.8 GB |
+| **persistent state**    |        **79.7 MiB** | **34.9 MiB** | **-44.8 MiB** |
+| compile-time RSS        |              167 MB | 1338 MB   | +1.2 GB |
 
-That's a **35% reduction** (-23.9 MiB). If we could fully drop the dead
-chain we'd land at ~32 MiB, matching llama.cpp's q8_0 exactly. End-to-end
-generation is bit-comparable to the f32 baseline -- top-token argmax
-identical, identical generation: "I am Qwen3.5, the latest large language
-model developed by Tongyi Lab. I am a text-based AI model...".
+State breakdown @ T=2560:
+- baseline: 60 MiB full_attn_kv (f32) + 18 RS + 1.7 conv = 79.7 MiB
+- int8 KV:  15 MiB full_attn_kv (i8) + 0.2 scale + 18 RS + 1.7 conv = **34.9 MiB**
+
+That's the **same persistent state size as llama.cpp** at this T (32.02 MiB
+measured earlier) — the original question is answered. End-to-end generation
+is identical to the f32 baseline ("I am Qwen3.5, the latest large language
+model developed by Tongyi Lab. I am a text-based AI model, which means I
+don't…").
+
+### Runtime cost honest take
+
+The persistent state goal is met, but the **decode runtime is 3× slower**
+and **peak RSS is 2.7× higher** during decode. Two root causes:
+
+1. **The QuantizedKVCache op materialises a full `[B, H, T_full, D]` f32
+   dequant tensor for SDPA on every call.** At T=2560 that is 5 MiB per K/V
+   buffer × 12 buffers × 512 decode steps -- lots of allocator churn the
+   stock Concat→Assign path doesn't have. Prefill is fine because the smaller
+   state has better cache locality and chunking bounds the working set, but
+   decode pays the dequant cost per token.
+2. **Compile-time RSS jumps +1.2 GB.** The plugin pre-faults all int8
+   weights at compile time when a custom op feeds SDPA, where the baseline
+   lazy-mmaps them on first infer.
+
+The proper fix is **a custom SDPA op that consumes i8 KV directly** -- what
+llama.cpp does. That replaces the current SDPA node with one that takes
+`(Q_f32, K_i8, K_scale, V_i8, V_scale, mask)` and never materialises the
+dequant'd full K or V. That's a real chunk of work (fused attention with
+mixed-dtype matmul + masked softmax) and the right next step if the runtime
+cost matters.
+
+### Dead-chain removal trick
+
+Removing the old f32 ReadValue/Concat/Assign chain looks impossible from
+Python (no `model.remove_node`), but works in stages:
+
+1. Selectively rewire all old-Concat consumers (including the old Assign)
+   to the new QuantizedKVCache's f32 output.
+2. The IR computes the SDPA GQA Broadcast target T as
+   `Add(ShapeOf(old_Gather)[2], N)` = `T_prev + N`. Redirect those ShapeOfs
+   to read from our new i8 Gather (`rv_data_g`), which preserves the
+   `T_prev` semantic exactly.
+3. Replace the rest of the old ReadValue's consumers with an empty f32
+   Constant so the dead Gather/Concat compute on empty tensors.
+4. `model.remove_sink(old_assign)` + `model.remove_variable(old_var)`.
+
+After this the old Variable is gone and the dead subgraph is unreferenced
+from any sink/parameter/result -- the plugin elides it at compile time.
 
 ### C kernel speedup (`qkv_kernel`)
 
