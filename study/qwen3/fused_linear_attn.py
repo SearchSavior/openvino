@@ -58,14 +58,12 @@ class GatedDeltaRule(Op):
         return True
 
     def evaluate(self, outputs, inputs):
-        # Input order matches ov::op::internal::GatedDeltaNet:
-        # (query, key, value, recurrent_state, gate, beta)
         q = np.asarray(inputs[0].data)
         k = np.asarray(inputs[1].data)
         v = np.asarray(inputs[2].data)
-        S = np.asarray(inputs[3].data).copy()
-        g = np.asarray(inputs[4].data)
-        beta = np.asarray(inputs[5].data)
+        g = np.asarray(inputs[3].data)
+        beta = np.asarray(inputs[4].data)
+        S = np.asarray(inputs[5].data).copy()
 
         B, H, T, Dk = q.shape
         Dv = v.shape[-1]
@@ -134,13 +132,9 @@ def _is_gated_delta_rule_loop(loop) -> bool:
 
 
 def replace_gated_delta_rule_loops(model: ov.Model) -> int:
-    """Walk `model`, replace each gated-delta-rule Loop with our subclass op.
+    """Walk `model`, replace each gated-delta-rule Loop with a fused op.
 
-    NOTE: input order matches ov::op::internal::GatedDeltaNet exactly —
-    (query, key, value, recurrent_state, gate, beta) — so that downstream
-    transformations like FuseL2NormIntoGDN that use wrap_type<GatedDeltaNet>
-    + is_castable can match us. Mismatching the order would break those
-    matchers (they expect L2-norm subgraph on inputs 0,1).
+    Returns the number of Loops replaced.
     """
     targets = [n for n in model.get_ops()
                if n.get_type_name() == "Loop" and _is_gated_delta_rule_loop(n)]
@@ -152,7 +146,7 @@ def replace_gated_delta_rule_loops(model: ov.Model) -> int:
         g     = loop.input(5).get_source_output()
         beta  = loop.input(6).get_source_output()
         state = loop.input(7).get_source_output()
-        fused = GatedDeltaRule([q, k, v, state, g, beta])
+        fused = GatedDeltaRule([q, k, v, g, beta, state])
         fused.set_friendly_name(loop.get_friendly_name() + "/Fused")
         loop.output(0).replace(fused.output(0))
         loop.output(1).replace(fused.output(1))
