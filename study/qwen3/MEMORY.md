@@ -214,22 +214,37 @@ now parallelised via `std::thread` spawned per call instead. Python/ctypes
 kernels keep libgomp in their own .so (loaded outside the OV plugin
 process).
 
-### Measured pp512 + tg32 (chunk=128, INFERENCE_NUM_THREADS=4)
+### Measured pp512 + tg32 (each config in a fresh subprocess, CACHE_DIR per config)
 
 | metric             | A. baseline f32 KV | B. int8 KV + f32 dequant | C. int8 KV + int8 SDPA |
 |--------------------|-------------------:|-------------------------:|-----------------------:|
-| pp512 duration     |             2.78s  |                  2.14s   |                20.68s  |
-| pp512 throughput   |        184 tok/s   |             239 tok/s    |          24.8 tok/s    |
-| **tg32 duration**  |             3.07s  |                  5.12s   |              **3.64s** |
-| **tg32 throughput**|     **10.43 tok/s**|              6.25 tok/s  |       **8.78 tok/s**   |
+| pp512 duration     |              4.03s |                    3.51s |                 22.10s |
+| pp512 throughput   |          127 tok/s |               146 tok/s  |           23.2 tok/s   |
+| pp512 peak RSS     |           2309 MB  |               2365 MB    |          **2302 MB**   |
+| **tg32 duration**  |              2.98s |                    4.71s |               **3.54s**|
+| **tg32 throughput**|     **10.74 tok/s**|              6.80 tok/s  |       **9.05 tok/s**   |
+| tg32 peak RSS      |           2311 MB  |               2475 MB    |          **2307 MB**   |
 | persistent state   |          32.4 MiB  |               22.9 MiB   |             22.9 MiB   |
 
-C cuts the decode gap to baseline from -40% (B) down to -16%, at the same
-22.9 MiB persistent state and identical generation. It pays for it on
-prefill: 184 -> 25 tok/s. Our scalar int8 SDPA kernel can't match the
-plugin's optimized blocked-GEMM SDPA at large T_q. Next steps: a
-persistent thread pool to amortise `std::thread` spawn, and a Flash-
-Attention-style tiled inner loop to compete on prefill.
+C cuts the decode gap to baseline from -37% (B) down to -16%, at the same
+22.9 MiB persistent state, **at essentially the same peak RSS as baseline
+(2307 vs 2311 MB)**, and identical generation. The int8 SDPA path pays for
+it on prefill: 127 -> 23 tok/s. Our scalar int8 SDPA kernel doesn't match
+the plugin's optimized blocked-GEMM SDPA at large T_q. Next steps for the
+prefill gap: a persistent thread pool to amortise `std::thread` spawn, and
+a Flash-Attention-style tiled inner loop.
+
+#### Why earlier benches reported a +1.7 GB peak RSS regression
+
+The previous in-process A->B->C loop showed C peaking at 3793 MB vs A's
+2087 MB. That was almost entirely an in-process accumulation artifact: each
+`core.compile_model` allocates ~1 GB of plugin-internal weight buffers, and
+running three configs sequentially kept all three sets resident. In a fresh
+subprocess each peak is ~2.3 GB regardless of config. The 10 MiB
+persistent-state difference is too small to surface in peak RSS, which is
+dominated by ~1 GB weights + ~1 GB compute scratch. The state win matters
+for use cases like serving many concurrent contexts (paged-style) where the
+per-context overhead compounds.
 
 ### Runtime cost (B alone, kept for context)
 
