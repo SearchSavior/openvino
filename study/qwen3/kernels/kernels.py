@@ -43,6 +43,13 @@ def get_lib() -> ctypes.CDLL:
             ctypes.c_int, ctypes.c_int, ctypes.c_int,
             ctypes.c_int, ctypes.c_int,
         ]
+        lib.qmm_kernel.restype = None
+        lib.qmm_kernel.argtypes = [
+            ctypes.c_void_p, ctypes.c_void_p,                      # act, u8
+            ctypes.c_void_p, ctypes.c_void_p,                      # scale, zp
+            ctypes.c_void_p,                                       # out
+            ctypes.c_int, ctypes.c_int, ctypes.c_int,              # M, N, K
+        ]
         _lib = lib
     return _lib
 
@@ -67,6 +74,25 @@ def gdr(q, k, v, g, beta, S, out):
         S.ctypes.data, out.ctypes.data,
         B, H, T, D,
     )
+
+
+def qmm(act, u8, scale, zp, out):
+    """In-place: writes out. act, scale (f16 bits), zp (u8), u8 must be C-contiguous."""
+    assert act.dtype == np.float32 and act.flags["C_CONTIGUOUS"]
+    assert u8.dtype == np.uint8 and u8.flags["C_CONTIGUOUS"]
+    assert scale.dtype == np.uint16 and scale.flags["C_CONTIGUOUS"]
+    assert zp.dtype == np.uint8 and zp.flags["C_CONTIGUOUS"]
+    assert out.dtype == np.float32 and out.flags["C_CONTIGUOUS"]
+    M = int(np.prod(act.shape[:-1]))
+    K = act.shape[-1]
+    N = u8.shape[0]
+    assert u8.shape[1] == K, f"u8.shape[1]={u8.shape[1]} != K={K}"
+    assert scale.shape[0] == N, f"scale.shape={scale.shape} != N={N}"
+    assert zp.shape[0] == N, f"zp.shape={zp.shape} != N={N}"
+    lib = get_lib()
+    lib.qmm_kernel(act.ctypes.data, u8.ctypes.data,
+                   scale.ctypes.data, zp.ctypes.data,
+                   out.ctypes.data, M, N, K)
 
 
 def conv1d(prev, cur, w, out, new_state):

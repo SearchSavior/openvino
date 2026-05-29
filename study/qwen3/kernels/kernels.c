@@ -12,6 +12,7 @@
  */
 #include <math.h>
 #include <stddef.h>
+#include <stdlib.h>
 #include <string.h>
 
 #ifdef _OPENMP
@@ -169,4 +170,84 @@ void conv1d_kernel(
             memcpy(ns_bc + (KS - T), cur_bc, sizeof(float) * (size_t)T);
         }
     }
+}
+
+
+/* ---------------------------------------------------------------------------
+ * qmm_kernel — dequant-on-the-fly int8 matmul, transpose_b semantics.
+ *
+ *   act        [M, K]            fp32
+ *   u8         [N, K]            uint8
+ *   scale      [N]               fp16 (cast inside)
+ *   zp         [N]               uint8
+ *   out        [M, N]            fp32
+ *
+ *   y[m, n] = scale[n] * (sum_k act[m, k] * (float)u8[n, k] - zp[n] * sum_k act[m, k])
+ *
+ * No bf16/f32 weight buffer is ever materialised. Per output row we read
+ * K bytes of u8 directly from the IR Constant (file-backed) plus 4 bytes
+ * scale + 1 byte zp.
+ *
+ * Parallelism: outer loop over N (output cols). Inner loop is K reductions.
+ * For each m we precompute sum_k act[m, k].
+ * --------------------------------------------------------------------------- */
+
+/* fp16 (binary16) -> fp32. Avoids depending on _Float16 / __fp16 by reading
+ * the raw bits. Matches IEEE 754 half precision. */
+static inline float f16_to_f32(unsigned short h)
+{
+    unsigned int sign = (unsigned int)(h & 0x8000) << 16;
+    unsigned int exp  = (h >> 10) & 0x1f;
+    unsigned int mant = h & 0x3ff;
+    unsigned int f;
+    if (exp == 0) {
+        if (mant == 0) {
+            f = sign;
+        } else {
+            /* subnormal */
+            int e = -1;
+            do { e++; mant <<= 1; } while ((mant & 0x400) == 0);
+            f = sign | ((unsigned int)(e + 127 - 14) << 23) | ((mant & 0x3ff) << 13);
+        }
+    } else if (exp == 0x1f) {
+        f = sign | 0x7f800000 | (mant << 13);
+    } else {
+        f = sign | ((unsigned int)(exp + 127 - 15) << 23) | (mant << 13);
+    }
+    union { unsigned int u; float f; } u; u.u = f; return u.f;
+}
+
+void qmm_kernel(
+    const float * __restrict__ act,
+    const unsigned char * __restrict__ u8,
+    const unsigned short * __restrict__ scale,
+    const unsigned char * __restrict__ zp,
+    float       * __restrict__ out,
+    int M, int N, int K)
+{
+    /* Precompute sum_k act[m, k] for each m. */
+    /* For typical M up to a few thousand this fits on stack. Use heap if big. */
+    float *act_sum = (float *)malloc(sizeof(float) * (size_t)M);
+    for (int m = 0; m < M; ++m) {
+        const float *a_m = act + (size_t)m * K;
+        float s = 0.0f;
+        for (int k = 0; k < K; ++k) s += a_m[k];
+        act_sum[m] = s;
+    }
+
+    #pragma omp parallel for schedule(static)
+    for (int n = 0; n < N; ++n) {
+        const unsigned char *w_n = u8 + (size_t)n * K;
+        const float sc_n = f16_to_f32(scale[n]);
+        const float zp_n = (float)zp[n];
+        for (int m = 0; m < M; ++m) {
+            const float *a_m = act + (size_t)m * K;
+            float dot = 0.0f;
+            for (int k = 0; k < K; ++k) {
+                dot += a_m[k] * (float)w_n[k];
+            }
+            out[(size_t)m * N + n] = sc_n * (dot - zp_n * act_sum[m]);
+        }
+    }
+    free(act_sum);
 }

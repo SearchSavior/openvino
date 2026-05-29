@@ -11,23 +11,57 @@ conv1d, dispatching to the C kernels via ctypes when `QWEN3_USE_C=1`), slices
 the lm_head, and feeds the prompt to the *stateful* model in chunks.
 
 All numbers below are **measured** on this container (seq=2048,
-`INFERENCE_NUM_THREADS=4`, `QWEN3_USE_C=1`, lm_head sliced). Reproduce with the
-commands at the bottom.
+`INFERENCE_NUM_THREADS=4`, `QWEN3_USE_C=1`). Reproduce with the commands at
+the bottom.
 
-## Measured — prefill peak RSS vs chunking
-
-| prefill mode | peak RSS (prefill) | persistent state |
-|---|---:|---:|
-| single-shot (`--no-chunk`)  | 4487 MB | 67.8 MB |
-| chunked, chunk=256          | 2246 MB | 67.8 MB |
-| chunked, chunk=128          | 2051 MB | 67.8 MB |
-| chunked, chunk=256 + u8 KV hint | 2246 MB | 67.8 MB (unchanged) |
+## Where the memory was going (attribution)
 
 After `compile_model`, before any infer: **166 MB** RSS (69 file-backed +
-97 anon). The 754 MB int8 weight `.bin` is mmap'd lazily — it is **not** all
-resident until the first infer touches it.
+97 anon). The 754 MB int8 weight `.bin` is mmap'd lazily.
 
-## Persistent state at 2048 tokens (all fp32)
+The single biggest cost was the **CPU plugin pre-decompressing every int8
+weight constant into a bf16/f32 in-memory buffer for matmul throughput**.
+At first infer this added ~866 MB of anon RSS, fixed regardless of sequence
+width (W=1 and W=32 produced identical weight_expand). The IR stores 717 MB
+of u8 weight Constants across 187 MatMuls (dequant chain
+`u8 → Convert(f16) → Subtract(zp u8) → Multiply(scale f16) → Convert(f32) → MatMul`).
+The plugin's pre-expanded copy was ~1.2× that footprint sitting alongside the
+file-backed Constants.
+
+## The kernels
+
+Three custom ops, each dispatching to a C kernel via ctypes when
+`QWEN3_USE_C=1`:
+
+1. **`GatedDeltaRule`** ([fused_linear_attn.py](kernels/fused_linear_attn.py)) —
+   replaces the unfused `Loop` body of the 18 linear-attention layers with a
+   single op that implements the recurrence. Numerically validated to ≈1e-8
+   against the HF `torch_recurrent_gated_delta_rule` reference.
+2. **`FusedCausalConv1d`** ([fused_conv1d.py](kernels/fused_conv1d.py)) — the
+   conv1d-with-state for those same layers, avoiding the `Concat(prev_state,
+   current)` materialization.
+3. **`QuantizedMatMul`** ([quantized_matmul.py](kernels/quantized_matmul.py)) —
+   takes `(act, u8_weight, scale_f16, zp_u8)` as four inputs and streams the
+   dequant in the inner loop. **Never materializes a bf16/f32 weight buffer.**
+   Math: `y[..., n] = scale[n] · (act · u8[n] − zp[n] · sum(act))`. The C
+   kernel parallelizes across output rows N with OpenMP.
+
+Plus a graph-only rewrite, [`lm_head_slice`](kernels/lm_head_slice.py): insert
+`Slice(axis=1, last token)` before the lm_head MatMul.
+
+## Measured — seq = 2048, chunk = 128
+
+| config                  | peak RSS | Δ vs baseline | prefill | persistent state |
+|-------------------------|---------:|--------------:|--------:|-----------------:|
+| stock IR (no fusions)   |  ~3.8 GB |             — |     —   |             —    |
+| + all 4 rewrites, qmm=none      | 2051 MB |              — |  11.2s  |    67.9 MB |
+| + qmm=lm_head only      |    **1805 MB** |   **−246 MB** |  11.7s  |    67.9 MB |
+| + qmm=all (187 matmuls) |    **1332 MB** |   **−719 MB** |    112s |    67.9 MB |
+
+After compile, before first infer: 166 MB RSS (qmm=none/lm_head) or 154 MB
+(qmm=all — the smaller graph drops some plugin scratch).
+
+### Persistent state at 2048 tokens (all fp32)
 
 | category | tensors | bytes |
 |---|---:|---:|
@@ -36,81 +70,63 @@ resident until the first infer touches it.
 | `conv1d_state` (18 layers)      | 18 |  1.7 MB  — fixed |
 | **TOTAL** | 48 | **67.8 MB** |
 
-The full-attn KV is the only part that scales with context: 3.0 MB at 128
+The full-attn KV is the only piece that scales with context: 3.0 MB at 128
 tokens → 48.0 MB at 2048. At fp32 that is 4× the q8_0 llama.cpp reference
-(~12 MB for the same 6 layers). Quantizing it is the main lever left on state.
+(~12 MB for the same 6 layers).
 
 ## What worked
 
 1. **lm_head slice** — only the last position is projected to the 248320-wide
-   vocab. Removes the `[T, vocab]` fp32 logits tensor (~2 GB at T=2048). Applied
-   in every row above.
-
+   vocab. Removes the `[T, vocab]` fp32 logits tensor (~2 GB at T=2048).
 2. **Chunked prefill** — feeding the stateful model in chunks bounds the
-   per-call activation footprint. Prefill peak drops **4487 → 2051 MB**
-   (chunk=128). Pure plain-`ov.Core`: the recurrent and conv state carry across
-   chunks for free; the full-attn KV grows in the infer_request. No accuracy or
-   state-size change (state is 67.8 MB regardless of chunking).
+   per-call activation footprint. Pure plain-`ov.Core`: recurrent and conv
+   state carry across chunks for free; the full-attn KV grows in the
+   infer_request.
+3. **`QuantizedMatMul` streaming dequant** — eliminates the plugin's bf16
+   weight repack. lm_head alone is 242 MB u8 → ~485 MB bf16; killing that
+   single repack saves 246 MB at peak. The full sweep (`qmm=all`) saves
+   719 MB but is 10× slower at prefill (the C kernel is a straight scalar
+   loop, no VNNI/AVX-512 int8 dot product — the right speedup target).
 
-## What did not work / open items
+## What did not work
 
-- **`KV_CACHE_PRECISION` hint is inert here.** u8 vs default gives byte-identical
-  state (67.8 MB) and the same peak. The hint targets the plugin's internal
-  SDPA/PagedAttention KV path; this IR exposes the full-attn KV as a stateful
-  `ReadValue/Assign` pair the hint does not touch. Getting the 48 MB KV to q8_0
-  parity needs our own KV-quantizing op / explicit KV handling.
+- **`KV_CACHE_PRECISION` hint is inert here.** u8 vs default gives
+  byte-identical state (67.8 MB) and the same peak. The hint targets the
+  plugin's internal SDPA/PagedAttention KV path; this IR exposes the full-attn
+  KV as a stateful `ReadValue/Assign` pair the hint does not touch.
+- **`INFERENCE_PRECISION_HINT=bf16` and `DYNAMIC_QUANTIZATION_GROUP_SIZE=0`
+  don't move the needle.** Same ~865 MB weight_expand as default.
 
-- **`validate_fusion.py` does not pass numerically.** Baseline `Loop` vs our
-  fused `GatedDeltaRule` gives max abs logit diff ≈ 2.0 (top-10 token overlap
-  10/10, so generations match, but it is not bit-equivalent). Must be root-caused
-  before trusting the fused path for correctness work — see "Architecture
-  correctness" below.
+## Correctness
 
-- **Prefill peak (2 GB) is still ~10× the state (68 MB).** The gap is infer-time
-  activations + first-touch of the int8 weights (and likely a plugin
-  decompression of int8 → fp32/bf16 for the matmuls). Untested hypothesis;
-  needs `get_profiling_info` / runtime-graph attribution to confirm where the
-  ~1.9 GB over the 166 MB compile baseline goes.
-
-## Architecture correctness (the precondition)
-
-Per the HF reference (`transformers.models.qwen3_5`), the linear-attention layer
-is gated-delta-net with: q/k optionally L2-normed, `q *= 1/sqrt(D)`, decay
-`g = -softplus(a + dt_bias) * exp(A_log)`, then the recurrence
-
-```
-S = S * exp(g_t)
-kv_mem = (S * k_t).sum(-2)
-delta  = (v_t - kv_mem) * beta_t
-S = S + k_t ⊗ delta
-out_t = (S * q_t).sum(-2)
-```
-
-Our `gdr_kernel` implements exactly this recurrence and assumes the scale and
-L2-norm are applied as graph ops *before* the op. The 2.0 logit gap suggests one
-of those pre-ops is not where we think it is in the exported IR (candidates:
-the `1/sqrt(D)` scale, the q/k L2-norm, or the order of `exp(g)` vs the gate).
-Next step is a per-layer activation diff (stock Loop output vs our op output) to
-localize it.
+- `kernels/test_kernels.py` — `gdr_kernel` matches HF
+  `torch_recurrent_gated_delta_rule` to **1.3e-8** max diff.
+- `openvino/validate_fusion.py` — with real (tokenized + embedded) inputs,
+  top-10 logit overlap is 10/10 between stock and fused; max abs diff ~0.4.
+  Random `inputs_embeds` is not a valid test — it amplifies sub-ULP ordering
+  differences in the 64-step multiplicative recurrence.
+- `openvino/generate.py` — end-to-end greedy decode with all rewrites
+  applied produces coherent text ("I am Qwen3.5, the latest large language
+  model developed by Tongyi Lab...").
 
 ## Next steps (ordered by expected payoff)
 
-1. Root-cause the `validate_fusion` 2.0 gap with a per-layer activation diff —
-   correctness gates everything else.
-2. Our own quantized full-attn KV op (48 → ~12 MB q8_0) — the only path to KV
-   parity, since the plugin hint is inert on this IR.
-3. fp16 recurrent + conv state (18 → ~9 MB) — small, low risk at these
-   magnitudes; needs the state tensors typed fp16.
-4. Attribute the 2 GB prefill peak: confirm int8-weight decompression and
-   whether the chunk activations can be bounded further.
+1. **Quantize the full-attn KV cache** to u8 in a custom KV op (48 → ~12 MB,
+   saves ~36 MB). The only path to KV parity with llama.cpp on this IR.
+2. **Speed up `QuantizedMatMul`** with AVX-512 VNNI int8 dot product, then
+   `qmm=all` becomes the default with no time penalty — saves ~700 MB.
+3. fp16 recurrent + conv state (18 → ~9 MB) — small, low risk.
 
 ## Reproduce
 
 ```bash
 cd study/qwen3
-QWEN3_USE_C=1 python openvino/lowmem_infer.py --seq 2048 --no-chunk
-QWEN3_USE_C=1 python openvino/lowmem_infer.py --seq 2048 --chunk 256
+# Baseline
 QWEN3_USE_C=1 python openvino/lowmem_infer.py --seq 2048 --chunk 128
-QWEN3_USE_C=1 python openvino/lowmem_infer.py --seq 2048 --chunk 256 --kv-precision u8
-python openvino/validate_fusion.py --prompt-len 16   # currently FAILS (2.0 gap)
+# Streaming int8 lm_head (the practical sweet spot)
+QWEN3_USE_C=1 python openvino/lowmem_infer.py --seq 2048 --chunk 128 --qmm lm_head
+# Memory ceiling (slow)
+QWEN3_USE_C=1 python openvino/lowmem_infer.py --seq 2048 --chunk 128 --qmm all
+# End-to-end generation (verify correctness)
+QWEN3_USE_C=1 python openvino/generate.py
 ```

@@ -14,6 +14,13 @@ void conv1d_kernel(const float *prev, const float *cur, const float *w,
                    float *out, float *new_state,
                    int B, int C, int KS, int T, int K);
 
+void qmm_kernel(const float *act,
+                const unsigned char *u8,
+                const unsigned short *scale,
+                const unsigned char *zp,
+                float *out,
+                int M, int N, int K);
+
 #ifdef __cplusplus
 }
 #endif

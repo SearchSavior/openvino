@@ -50,6 +50,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "kernels"))
 from fused_linear_attn import register as register_la, replace_gated_delta_rule_loops  # noqa: E402
 from fused_conv1d import register as register_cv, replace_causal_conv1d_chains  # noqa: E402
 from lm_head_slice import slice_lm_head_to_last_token  # noqa: E402
+from quantized_matmul import register as register_qmm, replace_quantized_matmuls  # noqa: E402
 
 MODEL_DIR = "/tmp/qwen3-work/qwen35-0.8b-int8"
 HIDDEN = 1024
@@ -155,16 +156,24 @@ def fmt(b):
 # ---------------------------------------------------------------------------
 # Model setup
 # ---------------------------------------------------------------------------
-def build_model(kv_precision: str | None, use_gdr=True, use_conv=True, use_slice=True):
+def build_model(kv_precision: str | None, use_gdr=True, use_conv=True,
+                use_slice=True, qmm_mode="none"):
     core = ov.Core()
     register_la(core)
     register_cv(core)
+    register_qmm(core)
 
     lm = core.read_model(f"{MODEL_DIR}/openvino_language_model.xml")
     n_gdr = replace_gated_delta_rule_loops(lm) if use_gdr else 0
     n_cv = replace_causal_conv1d_chains(lm) if use_conv else 0
     n_slice = slice_lm_head_to_last_token(lm) if use_slice else False
-    print(f"  rewrites: gdr={n_gdr}  conv1d={n_cv}  lm_head_slice={n_slice}")
+    if qmm_mode == "lm_head":
+        n_qmm = replace_quantized_matmuls(lm, name_filter=lambda nm: "lm_head" in nm)
+    elif qmm_mode == "all":
+        n_qmm = replace_quantized_matmuls(lm)
+    else:
+        n_qmm = 0
+    print(f"  rewrites: gdr={n_gdr}  conv1d={n_cv}  lm_head_slice={n_slice}  qmm={qmm_mode}({n_qmm})")
 
     cfg = {"INFERENCE_NUM_THREADS": 4, "PERFORMANCE_HINT": "LATENCY"}
     if kv_precision:
@@ -196,15 +205,15 @@ def position_ids(start, length):
 # Prefill (chunked or single-shot) + a few decode steps
 # ---------------------------------------------------------------------------
 def run(seq, chunk, kv_precision, decode_steps,
-        use_gdr=True, use_conv=True, use_slice=True):
+        use_gdr=True, use_conv=True, use_slice=True, qmm_mode="none"):
     print(f"\n{'=' * 72}")
     print(f"seq={seq}  chunk={chunk or 'single-shot'}  "
           f"kv_precision={kv_precision or 'default(f32)'}  "
-          f"gdr={use_gdr} conv={use_conv} slice={use_slice}")
+          f"gdr={use_gdr} conv={use_conv} slice={use_slice} qmm={qmm_mode}")
     print('=' * 72)
 
     s_rss0 = rss_mb()
-    compiled, embed = build_model(kv_precision, use_gdr, use_conv, use_slice)
+    compiled, embed = build_model(kv_precision, use_gdr, use_conv, use_slice, qmm_mode)
     logits_out = next(o for o in compiled.outputs if "logits" in o.get_any_name())
     s_compiled = smaps_mb()
     print(f"  after compile: RSS {rss_mb():8.1f} MB  "
@@ -286,12 +295,14 @@ def main():
     ap.add_argument("--no-gdr", action="store_true", help="keep the stock Loop (no custom GDR op)")
     ap.add_argument("--no-conv", action="store_true", help="keep the stock conv chain")
     ap.add_argument("--no-slice", action="store_true", help="do not slice the lm_head")
+    ap.add_argument("--qmm", choices=["none", "lm_head", "all"], default="none",
+                    help="streaming int8 matmul (skip plugin bf16 weight repack)")
     args = ap.parse_args()
 
     chunk = None if args.no_chunk else args.chunk
     res = run(args.seq, chunk, args.kv_precision, args.decode_steps,
               use_gdr=not args.no_gdr, use_conv=not args.no_conv,
-              use_slice=not args.no_slice)
+              use_slice=not args.no_slice, qmm_mode=args.qmm)
 
     print(f"\n{'-' * 72}")
     print(f"SUMMARY  prefill_peak={res['prefill_peak_mb']:.0f} MB  "
