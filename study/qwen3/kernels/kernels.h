@@ -29,6 +29,15 @@ void qmm_kernel_vnni(const float *act,
                      float *out,
                      int M, int N, int K);
 
+/* int8 KV cache update: dequant prev + quantise new + dequant full for SDPA. */
+void qkv_kernel(const signed char *prev_data,
+                const float       *prev_scale,
+                const float       *new_kv,
+                signed char       *new_data,
+                float             *new_scale,
+                float             *full_f32,
+                int B, int H, int T_prev, int N, int D);
+
 #ifdef __cplusplus
 }
 #endif

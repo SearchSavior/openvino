@@ -53,6 +53,12 @@ def get_lib() -> ctypes.CDLL:
         if hasattr(lib, "qmm_kernel_vnni"):
             lib.qmm_kernel_vnni.restype = None
             lib.qmm_kernel_vnni.argtypes = lib.qmm_kernel.argtypes
+        lib.qkv_kernel.restype = None
+        lib.qkv_kernel.argtypes = [
+            ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,    # prev_data, prev_scale, new_kv
+            ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,    # new_data, new_scale, full_f32
+            ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,  # B,H,T_prev,N,D
+        ]
         _lib = lib
     return _lib
 
@@ -103,6 +109,27 @@ def qmm(act, u8, scale, zp, out):
     fn(act.ctypes.data, u8.ctypes.data,
        scale.ctypes.data, zp.ctypes.data,
        out.ctypes.data, M, N, K)
+
+
+def qkv(prev_data, prev_scale, new_kv, new_data, new_scale, full_f32):
+    """In-place: writes new_data, new_scale, full_f32. All inputs C-contiguous."""
+    assert prev_data.dtype == np.int8 and prev_data.flags["C_CONTIGUOUS"]
+    assert prev_scale.dtype == np.float32 and prev_scale.flags["C_CONTIGUOUS"]
+    assert new_kv.dtype == np.float32 and new_kv.flags["C_CONTIGUOUS"]
+    assert new_data.dtype == np.int8 and new_data.flags["C_CONTIGUOUS"]
+    assert new_scale.dtype == np.float32 and new_scale.flags["C_CONTIGUOUS"]
+    assert full_f32.dtype == np.float32 and full_f32.flags["C_CONTIGUOUS"]
+    B, H, T_prev, D = prev_data.shape
+    _, _, N, _ = new_kv.shape
+    T_full = T_prev + N
+    assert new_data.shape == (B, H, T_full, D)
+    assert new_scale.shape == (B, H, T_full)
+    assert full_f32.shape == (B, H, T_full, D)
+    lib = get_lib()
+    lib.qkv_kernel(
+        prev_data.ctypes.data, prev_scale.ctypes.data, new_kv.ctypes.data,
+        new_data.ctypes.data,  new_scale.ctypes.data,  full_f32.ctypes.data,
+        B, H, T_prev, N, D)
 
 
 def conv1d(prev, cur, w, out, new_state):

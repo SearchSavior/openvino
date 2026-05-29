@@ -417,3 +417,132 @@ void qmm_kernel_vnni(
     free(act_sum_i8);
 }
 #endif  /* __AVX512VNNI__ */
+
+
+/* ---------------------------------------------------------------------------
+ * qkv_kernel - int8 KV cache update.
+ *
+ *   prev_data    [B, H, T_prev, D]   i8     existing quantised state
+ *   prev_scale   [B, H, T_prev]      f32    existing per-token scales
+ *   new_kv       [B, H, N,     D]    f32    new K (or V) for this chunk
+ *
+ *   new_data     [B, H, T_full, D]   i8     concatenated quantised state out
+ *   new_scale    [B, H, T_full]      f32    concatenated scales out
+ *   full_f32     [B, H, T_full, D]   f32    dequantised KV for SDPA
+ *
+ *   T_full = T_prev + N
+ *
+ * Per-token symmetric int8 quant on the new tokens:
+ *     scale_t = max|kv[..,t,:]| / 127
+ *     q_t[d]  = clip(round(kv[..,t,d] / scale_t), -128, 127)
+ * Then concatenate (prev, new) and dequantise the whole thing for SDPA.
+ * --------------------------------------------------------------------------- */
+void qkv_kernel(
+    const signed char  * __restrict__ prev_data,
+    const float        * __restrict__ prev_scale,
+    const float        * __restrict__ new_kv,
+    signed char        * __restrict__ new_data,
+    float              * __restrict__ new_scale,
+    float              * __restrict__ full_f32,
+    int B, int H, int T_prev, int N, int D)
+{
+    qmm_unpin_self();
+#ifdef _OPENMP
+    if (omp_get_max_threads() < 4) omp_set_num_threads(4);
+#endif
+    const int T_full = T_prev + N;
+    const size_t BH   = (size_t)B * (size_t)H;
+
+    /* Copy prev_data + prev_scale into the head of the new buffers. */
+    for (size_t bh = 0; bh < BH; ++bh) {
+        memcpy(new_data  + bh * T_full * D,
+               prev_data + bh * T_prev * D, (size_t)T_prev * D);
+        memcpy(new_scale + bh * T_full,
+               prev_scale + bh * T_prev,    (size_t)T_prev * sizeof(float));
+    }
+
+    /* Quantise the N new tokens, appending to the tail of (new_data, new_scale). */
+#if defined(__AVX512F__)
+    const __m512 abs_mask = _mm512_castsi512_ps(_mm512_set1_epi32(0x7fffffff));
+#endif
+    #pragma omp parallel for schedule(static)
+    for (size_t idx = 0; idx < BH * (size_t)N; ++idx) {
+        const size_t bh = idx / (size_t)N;
+        const int    t  = (int)(idx % (size_t)N);
+        const float *kv_t = new_kv + bh * (size_t)N * D + (size_t)t * D;
+
+        float mx = 0.0f;
+#if defined(__AVX512F__)
+        __m512 vmax = _mm512_setzero_ps();
+        int d = 0;
+        for (; d + 16 <= D; d += 16) {
+            __m512 v = _mm512_loadu_ps(kv_t + d);
+            v = _mm512_and_ps(v, abs_mask);
+            vmax = _mm512_max_ps(vmax, v);
+        }
+        mx = _mm512_reduce_max_ps(vmax);
+        for (; d < D; ++d) {
+            float a = fabsf(kv_t[d]); if (a > mx) mx = a;
+        }
+#else
+        for (int d = 0; d < D; ++d) {
+            float a = fabsf(kv_t[d]); if (a > mx) mx = a;
+        }
+#endif
+        float scale = mx > 1e-12f ? mx / 127.0f : 1e-12f;
+        float inv   = mx > 1e-12f ? 127.0f / mx : 0.0f;
+
+        signed char *out_t = new_data + bh * (size_t)T_full * D + (size_t)(T_prev + t) * D;
+#if defined(__AVX512F__)
+        __m512 inv_v = _mm512_set1_ps(inv);
+        const __m512i lo = _mm512_set1_epi32(-128);
+        const __m512i hi = _mm512_set1_epi32( 127);
+        int dd = 0;
+        for (; dd + 16 <= D; dd += 16) {
+            __m512 v = _mm512_loadu_ps(kv_t + dd);
+            v = _mm512_mul_ps(v, inv_v);
+            __m512i q = _mm512_cvtps_epi32(v);
+            q = _mm512_max_epi32(q, lo);
+            q = _mm512_min_epi32(q, hi);
+            __m128i q8 = _mm512_cvtepi32_epi8(q);
+            _mm_storeu_si128((__m128i *)(out_t + dd), q8);
+        }
+        for (; dd < D; ++dd) {
+            int q = (int)lrintf(kv_t[dd] * inv);
+            if (q > 127) q = 127; if (q < -128) q = -128;
+            out_t[dd] = (signed char)q;
+        }
+#else
+        for (int d = 0; d < D; ++d) {
+            int q = (int)lrintf(kv_t[d] * inv);
+            if (q > 127) q = 127; if (q < -128) q = -128;
+            out_t[d] = (signed char)q;
+        }
+#endif
+        new_scale[bh * (size_t)T_full + (size_t)(T_prev + t)] = scale;
+    }
+
+    /* Dequant the full state to f32 for SDPA. SIMD: u8/i8 -> i32 -> f32 -> *scale. */
+    #pragma omp parallel for schedule(static)
+    for (size_t idx = 0; idx < BH * (size_t)T_full; ++idx) {
+        const size_t bh = idx / (size_t)T_full;
+        const int    t  = (int)(idx % (size_t)T_full);
+        const float  sc = new_scale[bh * (size_t)T_full + (size_t)t];
+        const signed char *src = new_data + bh * (size_t)T_full * D + (size_t)t * D;
+        float             *dst = full_f32 + bh * (size_t)T_full * D + (size_t)t * D;
+#if defined(__AVX512F__)
+        __m512 sc_v = _mm512_set1_ps(sc);
+        int d = 0;
+        for (; d + 16 <= D; d += 16) {
+            __m128i i8 = _mm_loadu_si128((const __m128i *)(src + d));
+            __m512i i32 = _mm512_cvtepi8_epi32(i8);
+            __m512  f   = _mm512_cvtepi32_ps(i32);
+            f = _mm512_mul_ps(f, sc_v);
+            _mm512_storeu_ps(dst + d, f);
+        }
+        for (; d < D; ++d) dst[d] = (float)src[d] * sc;
+#else
+        for (int d = 0; d < D; ++d) dst[d] = (float)src[d] * sc;
+#endif
+    }
+}

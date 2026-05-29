@@ -185,6 +185,32 @@ generation is bit-comparable to the f32 baseline -- top-token argmax
 identical, identical generation: "I am Qwen3.5, the latest large language
 model developed by Tongyi Lab. I am a text-based AI model...".
 
+### C kernel speedup (`qkv_kernel`)
+
+Initial numpy `evaluate()` made `int8 KV` 2x SLOWER than the f32 baseline
+because per-token max/quant + concat + dequant of the growing state was
+running through numpy. C kernel with AVX-512 SIMD on all three legs (max
++ quant + dequant):
+
+| T_prev | numpy (us) | C (us) | speedup | max abs diff |
+|-------:|-----------:|-------:|--------:|-------------:|
+|      0 |        233 |     34 |    6.9x |      2.4e-7  |
+|    256 |       1110 |     48 |   22.9x |      2.4e-7  |
+|   1024 |       3047 |    120 |   25.4x |      2.4e-7  |
+|   1920 |       4863 |    217 |   22.4x |      4.8e-7  |
+
+In OV at seq=2048, chunk=128:
+
+| variant                          | prefill | state    |
+|----------------------------------|--------:|---------:|
+| baseline f32 KV (no rewrite)     |   14.4s | 67.8 MiB |
+| int8 KV, numpy `evaluate()`      |   30.8s | 43.9 MiB |
+| **int8 KV, C `qkv_kernel`**      | **12.9s** | **43.9 MiB** |
+
+So int8 KV with the C kernel is now strictly better than baseline on both
+axes: 35% less persistent state AND 10% faster prefill (the smaller state
+has better cache locality and the C kernel is bandwidth-bound).
+
 ## Next steps (ordered by expected payoff)
 
 1. Fully drop the dead f32 chain (the missing 12 MiB to reach llama.cpp

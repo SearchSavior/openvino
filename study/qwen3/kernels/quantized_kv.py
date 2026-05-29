@@ -40,6 +40,8 @@ from openvino import Op
 from openvino import opset15 as ops
 from openvino.op.util import Variable, VariableInfo
 
+from kernels import use_c as _use_c, qkv as _qkv_c
+
 
 class QuantizedKVCache(Op):
     """Dequant prev -> concat new -> requant new piece, all in one op."""
@@ -81,22 +83,33 @@ class QuantizedKVCache(Op):
         prev_scale = np.asarray(inputs[1].data)   # [B, H, T_prev]    f32
         new_kv     = np.asarray(inputs[2].data)   # [B, H, N,     D]  f32
 
-        # Per-token symmetric int8: scale = max|kv[..,t,:]| / 127.
-        max_abs   = np.maximum(np.abs(new_kv).max(axis=-1), 1e-12)   # [B, H, N]
-        new_scale = (max_abs / 127.0).astype(np.float32)
-        new_data  = np.clip(np.round(new_kv / new_scale[..., None]), -128, 127).astype(np.int8)
+        B, H, T_prev, D = prev_data.shape
+        _, _, N, _ = new_kv.shape
+        T_full = T_prev + N
 
-        full_data  = np.concatenate([prev_data,  new_data ], axis=2)
-        full_scale = np.concatenate([prev_scale, new_scale], axis=2)
-        # Dequant for SDPA. This is the only fp32 buffer that grows with T.
-        full_f32 = full_data.astype(np.float32) * full_scale[..., None]
+        outputs[0].shape = (B, H, T_full, D)
+        outputs[1].shape = (B, H, T_full, D)
+        outputs[2].shape = (B, H, T_full)
+        full_f32   = np.asarray(outputs[0].data)
+        new_data   = np.asarray(outputs[1].data)
+        new_scale  = np.asarray(outputs[2].data)
 
-        outputs[0].shape = full_f32.shape
-        np.asarray(outputs[0].data)[...] = full_f32
-        outputs[1].shape = full_data.shape
-        np.asarray(outputs[1].data)[...] = full_data
-        outputs[2].shape = full_scale.shape
-        np.asarray(outputs[2].data)[...] = full_scale
+        if _use_c():
+            prev_data_c  = np.ascontiguousarray(prev_data,  dtype=np.int8)
+            prev_scale_c = np.ascontiguousarray(prev_scale, dtype=np.float32)
+            new_kv_c     = np.ascontiguousarray(new_kv,     dtype=np.float32)
+            _qkv_c(prev_data_c, prev_scale_c, new_kv_c, new_data, new_scale, full_f32)
+            return True
+
+        # NumPy reference
+        max_abs    = np.maximum(np.abs(new_kv).max(axis=-1), 1e-12)
+        new_scale_q = (max_abs / 127.0).astype(np.float32)
+        new_data_q  = np.clip(np.round(new_kv / new_scale_q[..., None]), -128, 127).astype(np.int8)
+        new_data [:, :, :T_prev, :] = prev_data
+        new_data [:, :, T_prev:, :] = new_data_q
+        new_scale[:, :, :T_prev] = prev_scale
+        new_scale[:, :, T_prev:] = new_scale_q
+        full_f32[...] = new_data.astype(np.float32) * new_scale[..., None]
         return True
 
 
