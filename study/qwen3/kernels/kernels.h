@@ -38,6 +38,37 @@ void qkv_kernel(const signed char *prev_data,
                 float             *full_f32,
                 int B, int H, int T_prev, int N, int D);
 
+/* Fused SDPA reading i8 K/V directly (no f32 KV materialisation).
+ *
+ *   q         [B, H_q,  T_q,    D]    fp32  (post-RoPE, after GQA broadcast?)
+ *   k_data    [B, H_kv, T_full, D]    i8
+ *   k_scale   [B, H_kv, T_full]       fp32
+ *   v_data    [B, H_kv, T_full, D]    i8
+ *   v_scale   [B, H_kv, T_full]       fp32
+ *   mask      [B, 1, T_q, T_full]     fp32 or NULL
+ *   scale     1/sqrt(D)               fp32
+ *
+ *   out       [B, H_q, T_q, D]        fp32
+ *
+ * gqa_factor = H_q / H_kv. K/V are indexed by h_kv = h_q / gqa_factor.
+ * Standard scaled dot-product attention:
+ *   scores[t_q, t_k] = (Q[t_q, :] . dequant(K[h_kv, t_k, :])) * scale + mask[t_q, t_k]
+ *   weights = softmax(scores, dim=-1)
+ *   out[t_q, :] = sum_t_k weights[t_q, t_k] * dequant(V[h_kv, t_k, :])
+ *
+ * Dequant is fused into the dot/accumulate loops -- no full f32 K or V buffer
+ * is ever materialised.
+ */
+void int8_sdpa_kernel(const float       *q,
+                      const signed char *k_data,
+                      const float       *k_scale,
+                      const signed char *v_data,
+                      const float       *v_scale,
+                      const float       *mask,
+                      float              scale,
+                      float             *out,
+                      int B, int H_q, int H_kv, int T_q, int T_full, int D);
+
 #ifdef __cplusplus
 }
 #endif

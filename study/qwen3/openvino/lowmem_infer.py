@@ -156,7 +156,7 @@ def fmt(b):
 # ---------------------------------------------------------------------------
 # Model setup
 # ---------------------------------------------------------------------------
-def build_model(kv_precision: str | None, use_gdr=True, use_conv=True,
+def build_model(kv_precision: str | None, use_gdr=True, use_conv=False,
                 use_slice=True, qmm_mode="none"):
     core = ov.Core()
     register_la(core)
@@ -165,6 +165,11 @@ def build_model(kv_precision: str | None, use_gdr=True, use_conv=True,
 
     lm = core.read_model(f"{MODEL_DIR}/openvino_language_model.xml")
     n_gdr = replace_gated_delta_rule_loops(lm) if use_gdr else 0
+    # NOTE: `use_conv` defaults to False. The FusedCausalConv1d custom op exists
+    # in kernels/fused_conv1d.py for reference but adds 13-24% per-step Python
+    # dispatch overhead at decode (M=1) without offering a memory benefit -- the
+    # conv1d state is 1.7 MiB regardless. The plugin's native Concat ->
+    # GroupConvolution path is faster at this scale. Pass --conv to opt in.
     n_cv = replace_causal_conv1d_chains(lm) if use_conv else 0
     n_slice = slice_lm_head_to_last_token(lm) if use_slice else False
     if qmm_mode == "lm_head":
@@ -293,7 +298,7 @@ def main():
     ap.add_argument("--kv-precision", choices=["u8", "f16"], default=None)
     ap.add_argument("--decode-steps", type=int, default=8)
     ap.add_argument("--no-gdr", action="store_true", help="keep the stock Loop (no custom GDR op)")
-    ap.add_argument("--no-conv", action="store_true", help="keep the stock conv chain")
+    ap.add_argument("--conv", action="store_true", help="opt in to the FusedCausalConv1d custom op (off by default; adds per-step Python dispatch cost at decode with no memory benefit)")
     ap.add_argument("--no-slice", action="store_true", help="do not slice the lm_head")
     ap.add_argument("--qmm", choices=["none", "lm_head", "all"], default="none",
                     help="streaming int8 matmul (skip plugin bf16 weight repack)")
@@ -301,7 +306,7 @@ def main():
 
     chunk = None if args.no_chunk else args.chunk
     res = run(args.seq, chunk, args.kv_precision, args.decode_steps,
-              use_gdr=not args.no_gdr, use_conv=not args.no_conv,
+              use_gdr=not args.no_gdr, use_conv=args.conv,
               use_slice=not args.no_slice, qmm_mode=args.qmm)
 
     print(f"\n{'-' * 72}")
