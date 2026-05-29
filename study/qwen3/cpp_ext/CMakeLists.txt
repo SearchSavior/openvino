@@ -41,6 +41,14 @@ target_compile_options(${TARGET_NAME} PRIVATE
     -O3 -march=native -ffast-math -Wall -Wextra)
 
 target_include_directories(${TARGET_NAME} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+# The op header ov::op::internal::GatedDeltaNet lives in OV's dev_api which
+# isn't installed by the pip wheel. Point at the source tree directly; the
+# symbols are exported by the installed openvino_runtime .so already.
+if(DEFINED ENV{OPENVINO_SRC})
+    target_include_directories(${TARGET_NAME} PRIVATE $ENV{OPENVINO_SRC}/src/core/dev_api)
+else()
+    target_include_directories(${TARGET_NAME} PRIVATE /home/user/openvino/src/core/dev_api)
+endif()
 target_link_libraries(${TARGET_NAME} PRIVATE openvino::runtime)
 if(OpenMP_CXX_FOUND)
     target_link_libraries(${TARGET_NAME} PRIVATE OpenMP::OpenMP_C OpenMP::OpenMP_CXX)
