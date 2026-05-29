@@ -144,11 +144,54 @@ tokens → 48.0 MB at 2048. At fp32 that is 4× the q8_0 llama.cpp reference
   applied produces coherent text ("I am Qwen3.5, the latest large language
   model developed by Tongyi Lab...").
 
+## Int8 KV cache (`QuantizedKVCache`)
+
+We confirmed with `llama-bench` that llama.cpp at T=2048 with `-ctk q8_0
+-ctv q8_0 -fa 1` allocates **32.02 MiB** of KV+RS state (12.75 KV + 19.27 RS).
+The OV baseline at the same T was 67.8 MiB with fp32 KV. The gap is just K
+and V precision; both implementations correctly handle the hybrid arch.
+
+`kernels/quantized_kv.py` adds a custom op + IR rewrite that mirrors the
+llama.cpp design:
+
+- Each full-attn layer's f32 `K/V` state Variable is replaced by a pair:
+  `(data: i8 [B, 2, T, 256], scale: f32 [B, 2, T])`. Per-token symmetric
+  int8 (`scale_t = max|kv[..,t,:]| / 127`).
+- One op (`QuantizedKVCache`) takes `(prev_data, prev_scale, new_kv_f32)`
+  and emits `(full_kv_f32 for SDPA, new_data, new_scale)`. SDPA sees the
+  full dequant f32 tensor it expects -- no SDPA changes needed.
+
+OV doesn't expose a `remove_node` for the old f32 Variable's ReadValue;
+removing the matching Assign trips a "sibling output" check in the plugin's
+memory pass. As a workaround the old Variable is mutated `f32 -> i8` and
+Convert nodes bridge the dead chain, keeping its storage at 1/4 the bytes
+even though the dead Concat still grows with T.
+
+### Measured at T=2048 (chunk=128, real prompt embeddings)
+
+| state category            | OV f32 (stock) | OV int8 KV  |
+|---------------------------|---------------:|------------:|
+| `full_attn_kv_f32`        |   48.0 MiB     |     -       |
+| `full_attn_kv_i8` (dead)  |      -         |  12.0 MiB   |
+| `full_attn_kv_i8` (live)  |      -         |  12.0 MiB   |
+| `full_attn_scale_f32`     |      -         |   0.2 MiB   |
+| `linear_attn_state`       |   18.0 MiB     |  18.0 MiB   |
+| `conv1d_state`            |    1.7 MiB     |   1.7 MiB   |
+| **TOTAL persistent state**|  **67.8 MiB**  | **43.9 MiB** |
+
+That's a **35% reduction** (-23.9 MiB). If we could fully drop the dead
+chain we'd land at ~32 MiB, matching llama.cpp's q8_0 exactly. End-to-end
+generation is bit-comparable to the f32 baseline -- top-token argmax
+identical, identical generation: "I am Qwen3.5, the latest large language
+model developed by Tongyi Lab. I am a text-based AI model...".
+
 ## Next steps (ordered by expected payoff)
 
-1. **Quantize the full-attn KV cache** to u8 in a custom KV op (48 → ~12 MB,
-   saves ~36 MB). The only path to KV parity with llama.cpp on this IR.
-2. fp16 recurrent + conv state (18 → ~9 MB) — small, low risk.
+1. Fully drop the dead f32 chain (the missing 12 MiB to reach llama.cpp
+   parity). Blocked by lack of `remove_node` in the Python API; would need
+   either a `ModelPass` that runs at compile time, or to drop into the C++
+   API.
+2. fp16 recurrent + conv state (18 -> ~9 MB) -- small, low risk.
 3. Activation quantisation group-of-K (q8_0-style with K=32) instead of
    per-row, to claw back the ~0.7 % VNNI error and make it the default.
 
