@@ -36,6 +36,13 @@ def get_lib() -> ctypes.CDLL:
             ctypes.c_void_p, ctypes.c_void_p,                      # S, out
             ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
         ]
+        lib.gdr_kernel_v2.restype = None
+        lib.gdr_kernel_v2.argtypes = [
+            ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,    # mixed_qkv, g, beta
+            ctypes.c_void_p, ctypes.c_void_p,                      # S, out
+            ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,  # B, H, T, D
+            ctypes.c_int, ctypes.c_int,                            # key_dim, value_dim
+        ]
         lib.conv1d_kernel.restype = None
         lib.conv1d_kernel.argtypes = [
             ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,    # prev, cur, w
@@ -65,6 +72,28 @@ def get_lib() -> ctypes.CDLL:
 
 def _contig_f32(a):
     return np.ascontiguousarray(a, dtype=np.float32)
+
+
+def gdr_v2(mixed_qkv, g, beta, S, out, key_dim, value_dim):
+    """In-place: mutates S, writes out. All inputs must be C-contiguous float32.
+    mixed_qkv  [B, T, key_dim*2 + value_dim]  pre-split Q|K|V
+    g, beta    [B, T, H]
+    S          [B, H, D, D]  in/out
+    out        [B, T, H, D]
+    """
+    B, T, qkv_dim = mixed_qkv.shape
+    assert qkv_dim == key_dim * 2 + value_dim, f"qkv_dim {qkv_dim} != {key_dim*2 + value_dim}"
+    assert g.shape == (B, T, S.shape[1]) and beta.shape == g.shape, "g/beta shapes"
+    H, D, _ = S.shape[1], S.shape[2], S.shape[3]
+    assert out.shape == (B, T, H, D)
+    for arr in (mixed_qkv, g, beta, S, out):
+        assert arr.dtype == np.float32 and arr.flags["C_CONTIGUOUS"], "must be contiguous fp32"
+    lib = get_lib()
+    lib.gdr_kernel_v2(
+        mixed_qkv.ctypes.data, g.ctypes.data, beta.ctypes.data,
+        S.ctypes.data, out.ctypes.data,
+        B, H, T, D, key_dim, value_dim,
+    )
 
 
 def gdr(q, k, v, g, beta, S, out):

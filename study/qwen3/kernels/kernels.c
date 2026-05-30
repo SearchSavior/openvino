@@ -44,23 +44,114 @@ static void qmm_unpin_self(void)
 }
 
 /* ---------------------------------------------------------------------------
- * gdr_kernel — gated delta rule recurrence.
+ * gdr_kernel_v2 — gated-delta-rule recurrence with absorbed input prep.
  *
- *   q, k       [B, H, T, D]   query / key
- *   v          [B, H, T, D]   value
- *   g          [B, H, T]      decay gate (raw; exp'd inside)
- *   beta       [B, H, T]      step size
- *   S          [B, H, D, D]   in/out — gated state, mutated in place
- *   out        [B, H, T, D]   per-token output
+ *   mixed_qkv  [B, T, key_dim*2 + value_dim]   fp32   post-conv1d split source
+ *   g          [B, T, H]                        fp32   gate (pre-transpose)
+ *   beta       [B, T, H]                        fp32   step size (pre-transpose)
+ *   S          [B, H, D, D]                     fp32   recurrent state (in/out)
+ *   out        [B, T, H, D]                     fp32   per-token output
  *
- * Inner loop matches:
- *     g_t = exp(g[b,h,t]);  S *= g_t
- *     kv_mem[v] = sum_k S[k,v] * k_t[k]
- *     delta[v]  = (v_t[v] - kv_mem[v]) * beta_t
- *     S[k,v]   += k_t[k] * delta[v]
- *     out[v]    = sum_k S[k,v] * q_t[k]
+ * Per (b, t) the kernel slices mixed_qkv into three [H, D] blocks for Q/K/V,
+ * applies L2 norm to Q and K and multiplies Q by 1/sqrt(D), then runs the
+ * standard recurrence step. The transposes/reshapes/L2-norms/scale that
+ * surround the original GatedDeltaRule become C scratch — eliminating ~16
+ * IR-level intermediate tensors of shape [B, H, T, D] / [B, T, H, D] per
+ * linear-attn layer.
  *
- * Parallelism: independent across the BH outer axis.
+ * `key_dim = H * D` (typical: 16 * 128 = 2048).
+ * `value_dim = H * D` for this model (no GQA in linear-attn). qkv_dim =
+ * key_dim*2 + value_dim. Q occupies [0:key_dim], K [key_dim:2*key_dim],
+ * V [2*key_dim:qkv_dim] in the last axis of mixed_qkv.
+ *
+ * Output layout is [B, T, H, D] (no transpose). The downstream Reshape to
+ * [B, T, H*D] then feeds the norm-gate and out_proj just like before.
+ *
+ * Parallelism: outer (b, h). Per-thread heap state slot stored in S.
+ * --------------------------------------------------------------------------- */
+void gdr_kernel_v2(
+    const float * __restrict__ mixed_qkv,
+    const float * __restrict__ g,
+    const float * __restrict__ beta,
+    float       * __restrict__ S,
+    float       * __restrict__ out,
+    int B, int H, int T, int D,
+    int key_dim, int value_dim)
+{
+    (void)value_dim;
+    const int qkv_dim = key_dim * 2 + value_dim;
+    const float scale_q = 1.0f / sqrtf((float)D);
+    const float eps = 1e-6f;
+
+    #pragma omp parallel for collapse(2) schedule(static)
+    for (int b = 0; b < B; ++b) {
+        for (int h = 0; h < H; ++h) {
+            float *S_bh = S + ((size_t)b * H + h) * (size_t)D * D;
+
+            float q_buf[256];   /* D up to 256 fits */
+            float k_buf[256];
+            float v_buf[256];
+            float kv_mem[256];
+
+            for (int t = 0; t < T; ++t) {
+                const float *qkv_t = mixed_qkv + ((size_t)b * T + t) * qkv_dim;
+                const float *q_in = qkv_t + h * D;
+                const float *k_in = qkv_t + key_dim + h * D;
+                const float *v_in = qkv_t + key_dim * 2 + h * D;
+
+                /* L2 norm Q and K (per head). */
+                float qsq = 0.0f, ksq = 0.0f;
+                for (int d = 0; d < D; ++d) { qsq += q_in[d] * q_in[d]; ksq += k_in[d] * k_in[d]; }
+                const float q_inv = scale_q / sqrtf(qsq + eps);
+                const float k_inv = 1.0f    / sqrtf(ksq + eps);
+                for (int d = 0; d < D; ++d) {
+                    q_buf[d] = q_in[d] * q_inv;
+                    k_buf[d] = k_in[d] * k_inv;
+                    v_buf[d] = v_in[d];
+                }
+
+                const float g_t    = expf(g   [((size_t)b * T + t) * H + h]);
+                const float beta_t = beta[((size_t)b * T + t) * H + h];
+
+                /* S *= g_t */
+                const size_t D2 = (size_t)D * D;
+                for (size_t i = 0; i < D2; ++i) S_bh[i] *= g_t;
+
+                /* kv_mem[v] = sum_k S[k, v] * k_buf[k] */
+                for (int v = 0; v < D; ++v) kv_mem[v] = 0.0f;
+                for (int k = 0; k < D; ++k) {
+                    const float kv = k_buf[k];
+                    const float *Srow = S_bh + (size_t)k * D;
+                    for (int v = 0; v < D; ++v) kv_mem[v] += Srow[v] * kv;
+                }
+
+                /* delta = (v - kv_mem) * beta */
+                float delta[256];
+                for (int v = 0; v < D; ++v) delta[v] = (v_buf[v] - kv_mem[v]) * beta_t;
+
+                /* S[k, v] += k_buf[k] * delta[v] */
+                for (int k = 0; k < D; ++k) {
+                    const float kv = k_buf[k];
+                    float *Srow = S_bh + (size_t)k * D;
+                    for (int v = 0; v < D; ++v) Srow[v] += kv * delta[v];
+                }
+
+                /* out[b, t, h, d] = sum_k S[k, d] * q_buf[k] */
+                float *out_t = out + ((size_t)b * T + t) * H * D + (size_t)h * D;
+                for (int d = 0; d < D; ++d) out_t[d] = 0.0f;
+                for (int k = 0; k < D; ++k) {
+                    const float qv = q_buf[k];
+                    const float *Srow = S_bh + (size_t)k * D;
+                    for (int v = 0; v < D; ++v) out_t[v] += Srow[v] * qv;
+                }
+            }
+        }
+    }
+}
+
+
+/* ---------------------------------------------------------------------------
+ * gdr_kernel — original signature for backward compat.
  * --------------------------------------------------------------------------- */
 void gdr_kernel(
     const float * __restrict__ q,

@@ -10,6 +10,20 @@ void gdr_kernel(const float *q, const float *k, const float *v,
                 float *S, float *out,
                 int B, int H, int T, int D);
 
+/* gdr_kernel_v2: absorbs input prep (split / reshape / L2 norm / scale /
+ * transpose) of Q, K, V into the kernel. Eliminates ~16 IR-level
+ * intermediate tensors per linear-attn layer.
+ *   mixed_qkv [B, T, key_dim*2 + value_dim]
+ *   g, beta   [B, T, H]
+ *   S         [B, H, D, D] in/out
+ *   out       [B, T, H, D]
+ */
+void gdr_kernel_v2(const float *mixed_qkv,
+                   const float *g, const float *beta,
+                   float *S, float *out,
+                   int B, int H, int T, int D,
+                   int key_dim, int value_dim);
+
 void conv1d_kernel(const float *prev, const float *cur, const float *w,
                    float *out, float *new_state,
                    int B, int C, int KS, int T, int K);

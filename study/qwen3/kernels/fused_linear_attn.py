@@ -29,42 +29,114 @@ import numpy as np
 import openvino as ov
 from openvino import Op
 
-from kernels import use_c as _use_c, gdr as _gdr_c
+from kernels import use_c as _use_c, gdr as _gdr_c, gdr_v2 as _gdr_v2_c
 
 
 class GatedDeltaRule(Op):
-    """Fused linear-attention recurrence used in Qwen3-Next-family models."""
+    """Fused linear-attention recurrence used in Qwen3-Next-family models.
+
+    Two signatures:
+      v1 (6 inputs): q [B,H,T,D], k, v, g [B,H,T], beta, state
+                     -> out [B,H,T,D], new_state
+      v2 (4 inputs): mixed_qkv [B,T,key_dim*2+value_dim], g [B,T,H], beta, state
+                     -> out [B,T,H,D], new_state
+                     Absorbs the upstream split / reshape / L2-norm / Q-scale /
+                     transpose. Eliminates ~16 IR-level intermediate tensors
+                     per linear-attn layer.
+    """
 
     def __init__(self, inputs=None):
-        # The Op base __init__ takes care of registering the type and calling
-        # constructor_validate_and_infer_types() when inputs are passed.
         super().__init__(self, inputs)
 
+    def _is_v2(self):
+        return self.get_input_size() == 4
+
     def validate_and_infer_types(self):
-        # Output 0 is shaped like v ([B, H, S, D_v]).
-        # Output 1 is shaped like initial_state ([B, H, D_k, D_v]).
         et = self.get_input_element_type(0)
-        self.set_output_type(0, et, self.get_input_partial_shape(2))
-        self.set_output_type(1, et, self.get_input_partial_shape(5))
+        if self._is_v2():
+            # in[0] mixed_qkv  [B, T, key_dim*2 + value_dim]
+            # in[1] g           [B, T, H]
+            # in[2] beta        [B, T, H]
+            # in[3] state       [B, H, D, D]
+            mqkv = self.get_input_partial_shape(0)
+            gps  = self.get_input_partial_shape(1)
+            sps  = self.get_input_partial_shape(3)
+            out_shape = ov.PartialShape([mqkv[0], mqkv[1], gps[2], sps[3]])  # [B, T, H, D]
+            self.set_output_type(0, et, out_shape)
+            self.set_output_type(1, et, sps)
+        else:
+            # v1: original signature.
+            self.set_output_type(0, et, self.get_input_partial_shape(2))
+            self.set_output_type(1, et, self.get_input_partial_shape(5))
 
     def clone_with_new_inputs(self, new_inputs):
         return GatedDeltaRule(list(new_inputs))
 
     def visit_attributes(self, visitor):
-        # No attributes.
         return True
 
     def has_evaluate(self):
         return True
 
     def evaluate(self, outputs, inputs):
+        if self._is_v2():
+            return self._evaluate_v2(outputs, inputs)
+        return self._evaluate_v1(outputs, inputs)
+
+    def _evaluate_v2(self, outputs, inputs):
+        mqkv = np.asarray(inputs[0].data)   # [B, T, qkv_dim]
+        g    = np.asarray(inputs[1].data)   # [B, T, H]
+        beta = np.asarray(inputs[2].data)
+        S    = np.asarray(inputs[3].data).copy()
+        B, T, qkv_dim = mqkv.shape
+        H, D = g.shape[2], S.shape[3]
+        # No GQA in linear-attn: key_dim = value_dim = H * D.
+        key_dim = H * D
+        value_dim = qkv_dim - 2 * key_dim
+        outputs[0].shape = (B, T, H, D)
+        outputs[1].shape = S.shape
+        out = np.asarray(outputs[0].data)
+
+        if _use_c():
+            mqkv_c = np.ascontiguousarray(mqkv, dtype=np.float32)
+            g_c    = np.ascontiguousarray(g,    dtype=np.float32)
+            b_c    = np.ascontiguousarray(beta, dtype=np.float32)
+            S_c    = np.ascontiguousarray(S,    dtype=np.float32)
+            out_c  = np.empty((B, T, H, D), dtype=np.float32)
+            _gdr_v2_c(mqkv_c, g_c, b_c, S_c, out_c, key_dim, value_dim)
+            out[...] = out_c
+            np.asarray(outputs[1].data)[...] = S_c
+            return True
+
+        # NumPy reference for v2.
+        eps = 1e-6
+        Q = mqkv[..., :key_dim].reshape(B, T, H, D).astype(np.float32)
+        K = mqkv[..., key_dim:2*key_dim].reshape(B, T, H, D).astype(np.float32)
+        V = mqkv[..., 2*key_dim:].reshape(B, T, H, D).astype(np.float32)
+        Q = Q / np.sqrt((Q*Q).sum(-1, keepdims=True) + eps) / np.sqrt(D)
+        K = K / np.sqrt((K*K).sum(-1, keepdims=True) + eps)
+        for t in range(T):
+            for h in range(H):
+                qt = Q[:, t, h, :]
+                kt = K[:, t, h, :]
+                vt = V[:, t, h, :]
+                gt = np.exp(g[:, t, h])[:, None, None]
+                bt = beta[:, t, h][:, None]
+                S[:, h] *= gt
+                kv_mem = np.einsum("bkv,bk->bv", S[:, h], kt)
+                delta  = (vt - kv_mem) * bt
+                S[:, h] += np.einsum("bk,bv->bkv", kt, delta)
+                out[:, t, h, :] = np.einsum("bkv,bk->bv", S[:, h], qt)
+        np.asarray(outputs[1].data)[...] = S
+        return True
+
+    def _evaluate_v1(self, outputs, inputs):
         q = np.asarray(inputs[0].data)
         k = np.asarray(inputs[1].data)
         v = np.asarray(inputs[2].data)
         g = np.asarray(inputs[3].data)
         beta = np.asarray(inputs[4].data)
         S = np.asarray(inputs[5].data).copy()
-
         B, H, T, Dk = q.shape
         Dv = v.shape[-1]
         outputs[0].shape = (B, H, T, Dv)
@@ -90,13 +162,11 @@ class GatedDeltaRule(Op):
             v_t = v[:, :, t, :]
             g_t = np.exp(g[:, :, t])[..., None, None]
             beta_t = beta[:, :, t][..., None]
-
             S *= g_t
             kv_mem = np.einsum("bhkv,bhk->bhv", S, k_t)
             delta = (v_t - kv_mem) * beta_t
             S += np.einsum("bhk,bhv->bhkv", k_t, delta)
             out[:, :, t, :] = np.einsum("bhkv,bhk->bhv", S, q_t)
-
         np.asarray(outputs[1].data)[...] = S
         return True
 
@@ -154,6 +224,153 @@ def replace_gated_delta_rule_loops(model: ov.Model) -> int:
     return len(targets)
 
 
+# ---------------------------------------------------------------------------
+# v2 rewrite: absorb the pre-GDR input prep (split, reshape, L2-norm, scale,
+# transpose) for Q/K/V into the kernel. Same for g/beta (skip their final
+# Transpose). This eliminates ~16 intermediate tensors per linear-attn layer.
+# ---------------------------------------------------------------------------
+def _walk_up(node, max_hops=8):
+    """Yield (depth, node) walking input(0) until Constant/Param/depth limit."""
+    yield 0, node
+    for i in range(max_hops):
+        if node.get_input_size() == 0:
+            return
+        node = node.input(0).get_source_output().get_node()
+        yield i + 1, node
+
+
+def _find_mixed_qkv_for_q(q_src_output):
+    """The K/V/Q inputs to GDR are post: Transpose -> Multiply -> Reshape ->
+    VariadicSplit -> Transpose([B,T,6144]) -> Swish.
+
+    Walk up from q's source and return the Output handle of the Transpose
+    node whose output is [B, T, qkv_dim] (= mixed_qkv pre-split).
+    """
+    n = q_src_output.get_node()
+    for _, nn in _walk_up(n, 10):
+        ps = nn.get_output_partial_shape(0)
+        if ps.rank.get_length() == 3 and ps[2].is_static and ps[2].get_length() == 6144:
+            return nn.output(0)
+    return None
+
+
+def _find_pre_transpose_3d(src_output, hops=6):
+    """g and beta are reached via a final Transpose [?,?,16] -> [?,16,?].
+    Return the Output handle of the node BEFORE that Transpose (still [B,T,H]).
+    """
+    n = src_output.get_node()
+    # The first node is the Transpose itself (per the GDR.input(3)/(4)).
+    if n.get_type_name() == "Transpose":
+        return n.input(0).get_source_output()
+    return src_output  # already pre-transpose
+
+
+def replace_gated_delta_rule_loops_v2(model: ov.Model) -> int:
+    """Same as replace_gated_delta_rule_loops, but use the v2 signature with
+    absorbed input prep. The output of v2 is [B, T, H, D]; we insert a
+    Transpose back to [B, H, T, D] so the downstream graph is unchanged.
+
+    Returns the number of Loops replaced.
+    """
+    from openvino import opset15 as ops
+    targets = [n for n in model.get_ops()
+               if n.get_type_name() == "Loop" and _is_gated_delta_rule_loop(n)]
+
+    replaced = 0
+    for loop in targets:
+        q_src    = loop.input(2).get_source_output()
+        g_src    = loop.input(5).get_source_output()
+        beta_src = loop.input(6).get_source_output()
+        state    = loop.input(7).get_source_output()
+
+        mixed_qkv = _find_mixed_qkv_for_q(q_src)
+        if mixed_qkv is None:
+            # couldn't find a [B, T, 6144] tensor above; fall back to v1.
+            q     = loop.input(2).get_source_output()
+            k     = loop.input(3).get_source_output()
+            v     = loop.input(4).get_source_output()
+            fused = GatedDeltaRule([q, k, v, g_src, beta_src, state])
+            fused.set_friendly_name(loop.get_friendly_name() + "/Fused")
+            loop.output(0).replace(fused.output(0))
+            loop.output(1).replace(fused.output(1))
+            replaced += 1
+            continue
+
+        g_pre    = _find_pre_transpose_3d(g_src)
+        beta_pre = _find_pre_transpose_3d(beta_src)
+
+        fused = GatedDeltaRuleV2([mixed_qkv, g_pre, beta_pre, state])
+        fused.set_friendly_name(loop.get_friendly_name() + "/FusedV2")
+        # v2 output is [B, T, H, D]. The original Loop.output(0) is [B, H, T, D].
+        # Insert a Transpose([0, 2, 1, 3]) to bring it back.
+        perm = ops.constant(np.array([0, 2, 1, 3], dtype=np.int64))
+        out_BHTD = ops.transpose(fused.output(0), perm)
+        loop.output(0).replace(out_BHTD.output(0))
+        loop.output(1).replace(fused.output(1))
+        replaced += 1
+
+    return replaced
+
+
+class GatedDeltaRuleV2(Op):
+    """v2 op with absorbed split / L2-norm / Q-scale / transpose.
+
+    Inputs: mixed_qkv [B,T,key_dim*2+value_dim], g [B,T,H], beta [B,T,H], state [B,H,D,D]
+    Outputs: out [B,T,H,D], new_state [B,H,D,D]
+
+    The C++ extension `Qwen3Ext::GatedDeltaRuleV2` matches this op name and
+    takes over evaluate() at runtime when the .so is loaded via core.add_extension.
+    The numpy fallback below is for diagnostics only.
+    """
+
+    def __init__(self, inputs=None):
+        super().__init__(self, inputs)
+
+    def validate_and_infer_types(self):
+        et = self.get_input_element_type(0)
+        mqkv = self.get_input_partial_shape(0)
+        gps  = self.get_input_partial_shape(1)
+        sps  = self.get_input_partial_shape(3)
+        out_shape = ov.PartialShape([mqkv[0], mqkv[1], gps[2], sps[3]])
+        self.set_output_type(0, et, out_shape)
+        self.set_output_type(1, et, sps)
+
+    def clone_with_new_inputs(self, new_inputs):
+        return GatedDeltaRuleV2(list(new_inputs))
+
+    def visit_attributes(self, visitor):
+        return True
+
+    def has_evaluate(self):
+        return True
+
+    def evaluate(self, outputs, inputs):
+        mqkv = np.asarray(inputs[0].data)
+        g    = np.asarray(inputs[1].data)
+        beta = np.asarray(inputs[2].data)
+        S    = np.asarray(inputs[3].data).copy()
+        B, T, qkv_dim = mqkv.shape
+        H, D = g.shape[2], S.shape[3]
+        key_dim = H * D
+        value_dim = qkv_dim - 2 * key_dim
+        outputs[0].shape = (B, T, H, D)
+        outputs[1].shape = S.shape
+        out = np.asarray(outputs[0].data)
+        if _use_c():
+            mqkv_c = np.ascontiguousarray(mqkv, dtype=np.float32)
+            g_c    = np.ascontiguousarray(g,    dtype=np.float32)
+            b_c    = np.ascontiguousarray(beta, dtype=np.float32)
+            S_c    = np.ascontiguousarray(S,    dtype=np.float32)
+            out_c  = np.empty((B, T, H, D), dtype=np.float32)
+            _gdr_v2_c(mqkv_c, g_c, b_c, S_c, out_c, key_dim, value_dim)
+            out[...] = out_c
+            np.asarray(outputs[1].data)[...] = S_c
+            return True
+        # NumPy fallback (slow; for the C++ op path this should never run).
+        return GatedDeltaRule._evaluate_v2(self, outputs, inputs)
+
+
 def register(core: ov.Core) -> None:
-    """Register the custom op with an OV Core so compile_model can dispatch it."""
+    """Register the custom op classes with an OV Core."""
     core.add_extension(GatedDeltaRule)
+    core.add_extension(GatedDeltaRuleV2)
