@@ -144,6 +144,89 @@ tokens → 48.0 MB at 2048. At fp32 that is 4× the q8_0 llama.cpp reference
   applied produces coherent text ("I am Qwen3.5, the latest large language
   model developed by Tongyi Lab...").
 
+## Memory attribution (where the bytes actually are)
+
+`openvino/attribute_mem.py` walks the source IR and the post-compile runtime
+graph to bucket addressable bytes by op type, role, and growth class. Run it
+with `--config baseline/int8_kv_dequant/int8_sdpa` to compare variants.
+
+Findings at `T_q=128`, baseline:
+
+**Source IR weight Constants: 720 MiB total**
+- MLP (gate / up / down × 24 layers):   252 MiB (35%)
+- tied embed/lm_head (248320 × 1024 u8): 243 MiB (34%)
+- linear-attn in_proj_qkv (× 18):        108 MiB (15%)
+- self-attn q/k/v/o (× 6):                42 MiB (6%)
+- linear-attn in_proj_{z,a,b}:            37 MiB (5%)
+- linear-attn out_proj:                   36 MiB (5%)
+
+**Activation budget at T_q=128: ~1.15 GiB** (sum of addressable bytes if
+every activation tensor were live; actual peak is lower due to OV's
+liveness-based memory planning, but this is the upper bound the planner
+sees).
+
+  - **linear_attn: 818 MiB (71%)**  -- the gated-delta-net path
+  -  self_attn:     66 MiB (6%)
+  -  mlp:           42 MiB (4%)
+  -  other:        227 MiB (20%)
+
+Per linear-attn layer: 41 MiB of f32 activation tensors. There are 18 of
+them. Top shapes:
+
+| shape (T_q=128)        | count | total MiB | what it is                  |
+|------------------------|------:|----------:|-----------------------------|
+| [1, 6144, 128]   f32   |    54 |     162.0 | conv1d in/out, in_proj_qkv  |
+| [1, 16, 128, 128] f32  |   145 |     145.0 | gated-delta Q/K/V/gate      |
+| [1, 128, 16, 128] f32  |   144 |     144.0 | same, transposed            |
+| [1, 6144, 132]   f32   |    36 |     111.4 | conv1d state + 4 (kernel)   |
+| [1, 128, 2048]   f32   |    90 |      90.0 | gated-delta intermediates   |
+| [262144]         f32   |    72 |      72.0 | recurrent state flattened   |
+
+### What this means
+
+Our int8 SDPA rewrite (`replace_kv_with_int8_sdpa`) was compared head to
+head with baseline at the activation level:
+
+```
+                  linear_attn  self_attn  mlp  other  TOTAL
+BASELINE          818.2 MiB     66.1     42.0  227.2  1153.4 MiB
+INT8 SDPA         818.2 MiB     66.1     42.0  227.2  1153.4 MiB
+delta             +0.0  +0.0  +0.0  +0.0  +0.0
+```
+
+**Zero activation-memory delta.** The KV chain optimisations only touch the
+6 full-attn layers; the other 18 layers (linear-attn) drive 71 % of the
+activation budget and are untouched. **Until we reduce the per-layer
+linear-attn footprint, the KV work is invisible in peak RSS.** The
+persistent-state win (44 MiB) is dwarfed by ~820 MiB of activation
+intermediates.
+
+llama.cpp's reported compute buffer for the same workload was 491 MiB.
+Our 1.15 GiB addressable activation budget is about 2.4× that. The
+mostly-likely culprit, layer-for-layer, is the way the exported gated-
+delta-net path materialises Q/K/V/gate and conv1d intermediates as
+separate edges. Reducing it would mean either fusing more of the
+gated-delta-net body into the custom op (so its intermediates live only
+in C stack scratch), or operating on a leaner representation (e.g. fp16
+intermediates inside the gated-delta-net).
+
+### Tooling: `openvino/attribute_mem.py`
+
+The attribution script:
+- Walks the source IR Constants, buckets by friendly-name role to get a
+  precise weight breakdown (Constant element_type + role-based bucketing).
+- Re-compiles with `model.reshape({input: [B, T_q, ...]})` to bind dynamic
+  dims so the post-compile runtime graph has static shapes everywhere.
+- Walks `get_runtime_model()` and for each output tensor computes bytes
+  from the (now-static) shape and element type.
+- Distinguishes weights from activations by friendly-name patterns
+  (`embed_tokens`, `_proj`, `.weight`, `ssm_*`, etc.).
+- Buckets activations by sub-architecture (linear_attn vs self_attn vs
+  mlp vs other) and by per-layer index.
+- Supports `--dump-runtime <xml>` for offline graph inspection.
+- Can be paired with `ONEDNN_VERBOSE=all` to capture per-primitive
+  memory descriptors during a single inference.
+
 ## Int8 KV cache (`QuantizedKVCache`)
 
 We confirmed with `llama-bench` that llama.cpp at T=2048 with `-ctk q8_0
