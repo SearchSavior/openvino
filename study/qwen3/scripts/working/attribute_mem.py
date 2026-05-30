@@ -24,7 +24,7 @@ import sys
 from collections import defaultdict
 from pathlib import Path
 
-sys.path.insert(0, "/home/user/openvino/study/qwen3/kernels")
+sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "kernels"))
 import numpy as np
 import openvino as ov
 
@@ -34,7 +34,7 @@ from quantized_kv       import register as rqkv, replace_kv_with_int8
 from quantized_int8_sdpa import register as rqi,  replace_kv_with_int8_sdpa
 
 MODEL = "/tmp/qwen3-work/qwen35-0.8b-int8"
-SO    = "/home/user/openvino/study/qwen3/cpp_ext/build/libqwen3_ov_ext.so"
+SO    = str(Path(__file__).resolve().parents[2] / "cpp_ext/build/libqwen3_ov_ext.so")
 
 ETYPE_BYTES = {
     "f32": 4, "f16": 2, "bf16": 2,

@@ -43,12 +43,12 @@ import openvino as ov
 import numpy as np
 from collections import defaultdict
 from pathlib import Path
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "kernels"))
+sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "kernels"))
 from fused_linear_attn import register as rla, replace_gated_delta_rule_loops, replace_gated_delta_rule_loops_v2
 from lm_head_slice import slice_lm_head_to_last_token
 
 MODEL = "/tmp/qwen3-work/qwen35-0.8b-int8"
-SO = "/home/user/openvino/study/qwen3/cpp_ext/build/libqwen3_ov_ext.so"
+SO = str(Path(__file__).resolve().parents[2] / "cpp_ext/build/libqwen3_ov_ext.so")
 
 ETYPE = {"f32":4,"f16":2,"bf16":2,"i64":8,"i32":4,"i8":1,"u8":1,"boolean":1}
 WK = ("embed_tokens","lm_head","_proj/",".weight",".bias","rotary","inv_freq",
