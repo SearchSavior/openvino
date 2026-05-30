@@ -44,6 +44,154 @@ static void qmm_unpin_self(void)
 }
 
 /* ---------------------------------------------------------------------------
+ * gdr_kernel_v3 — absorbs the conv1d-with-state + SiLU + Transpose chain too.
+ *
+ *   mixed_in    [B, T, C]              fp32   in_proj_qkv MatMul output (no transpose)
+ *   conv_w      [C, K]                 fp32   depthwise conv weights
+ *   prev_conv   [B, C, K-1]            fp32   previous conv state
+ *   g, beta     [B, T, H]              fp32
+ *   S           [B, H, D, D]           fp32   recurrent state (in/out)
+ *
+ *   out         [B, T, H, D]           fp32
+ *   new_conv    [B, C, K-1]            fp32   last K-1 columns of (prev ++ cur)
+ *
+ *   C = key_dim * 2 + value_dim. Q occupies channels [0:key_dim], K
+ *   [key_dim:2*key_dim], V [2*key_dim:C].
+ *
+ * The IR has  MatMul -> Transpose [B,C,T] -> Concat(state) -> GroupConv ->
+ * Slice -> Swish -> Transpose [B,T,C] -> VariadicSplit -> ... -> GDR.
+ * Everything except the MatMul is absorbed here; no IR-level edge buffers
+ * for the conv chain or split intermediates.
+ *
+ * Parallelism: outer (b, h). Conv1d work is done up front per b.
+ * --------------------------------------------------------------------------- */
+static inline float sigmoidf(float x) {
+    return 1.0f / (1.0f + expf(-x));
+}
+
+void gdr_kernel_v3(
+    const float * __restrict__ mixed_in,
+    const float * __restrict__ conv_w,
+    const float * __restrict__ prev_conv,
+    const float * __restrict__ g,
+    const float * __restrict__ beta,
+    float       * __restrict__ S,
+    float       * __restrict__ out,
+    float       * __restrict__ new_conv,
+    int B, int H, int T, int D,
+    int C, int K_conv,
+    int key_dim, int value_dim)
+{
+    (void)value_dim;
+    const int KS = K_conv - 1;          /* state length (typical: 3 for kernel=4) */
+    const int qkv_dim = C;
+    const float scale_q = 1.0f / sqrtf((float)D);
+    const float eps = 1e-6f;
+
+    /* Scratch: per-b post-conv post-SiLU tensor in [T, C] (NLC) layout.
+     * Allocated on heap; one chunk per OMP thread isn't worth it given C*T
+     * is shared across (h) of the same b. Size: B * T * C * 4 bytes.
+     * For B=1, T=128, C=6144: 3 MiB. */
+    float *post = (float *)malloc((size_t)B * T * C * sizeof(float));
+
+    /* Step 1: conv1d-with-state + SiLU, written into `post` in [B, T, C]. */
+    #pragma omp parallel for collapse(2) schedule(static)
+    for (int b = 0; b < B; ++b) {
+        for (int c = 0; c < C; ++c) {
+            const float *prev_bc = prev_conv + ((size_t)b * C + c) * KS;
+            const float *wc = conv_w + (size_t)c * K_conv;
+            float *new_state_bc = new_conv + ((size_t)b * C + c) * KS;
+
+            /* For each output t in [0, T), compute the depthwise conv. */
+            for (int t = 0; t < T; ++t) {
+                float acc = 0.0f;
+                for (int k = 0; k < K_conv; ++k) {
+                    /* Source index in the implicit padded sequence (prev ++ cur). */
+                    int src = t + k - KS;
+                    float v;
+                    if (src < 0) {
+                        v = prev_bc[src + KS];
+                    } else {
+                        v = mixed_in[((size_t)b * T + src) * C + c];
+                    }
+                    acc += wc[k] * v;
+                }
+                /* SiLU */
+                float s = acc * sigmoidf(acc);
+                post[((size_t)b * T + t) * C + c] = s;
+            }
+
+            /* new state = last KS items of (prev ++ cur), per channel. */
+            if (T >= KS) {
+                for (int i = 0; i < KS; ++i) {
+                    new_state_bc[i] = mixed_in[((size_t)b * T + (T - KS + i)) * C + c];
+                }
+            } else {
+                int tail = KS - T;
+                for (int i = 0; i < tail; ++i)
+                    new_state_bc[i] = prev_bc[T + i];
+                for (int i = 0; i < T; ++i)
+                    new_state_bc[tail + i] = mixed_in[((size_t)b * T + i) * C + c];
+            }
+        }
+    }
+
+    /* Step 2: identical to gdr_kernel_v2 working on `post` as mixed_qkv. */
+    #pragma omp parallel for collapse(2) schedule(static)
+    for (int b = 0; b < B; ++b) {
+        for (int h = 0; h < H; ++h) {
+            float *S_bh = S + ((size_t)b * H + h) * (size_t)D * D;
+            float q_buf[256], k_buf[256], v_buf[256], kv_mem[256], delta[256];
+
+            for (int t = 0; t < T; ++t) {
+                const float *qkv_t = post + ((size_t)b * T + t) * qkv_dim;
+                const float *q_in = qkv_t + h * D;
+                const float *k_in = qkv_t + key_dim + h * D;
+                const float *v_in = qkv_t + key_dim * 2 + h * D;
+
+                float qsq = 0.0f, ksq = 0.0f;
+                for (int d = 0; d < D; ++d) { qsq += q_in[d]*q_in[d]; ksq += k_in[d]*k_in[d]; }
+                const float q_inv = scale_q / sqrtf(qsq + eps);
+                const float k_inv = 1.0f    / sqrtf(ksq + eps);
+                for (int d = 0; d < D; ++d) {
+                    q_buf[d] = q_in[d] * q_inv;
+                    k_buf[d] = k_in[d] * k_inv;
+                    v_buf[d] = v_in[d];
+                }
+
+                const float g_t    = expf(g   [((size_t)b * T + t) * H + h]);
+                const float beta_t = beta[((size_t)b * T + t) * H + h];
+
+                const size_t D2 = (size_t)D * D;
+                for (size_t i = 0; i < D2; ++i) S_bh[i] *= g_t;
+                for (int v = 0; v < D; ++v) kv_mem[v] = 0.0f;
+                for (int k = 0; k < D; ++k) {
+                    const float kv = k_buf[k];
+                    const float *Srow = S_bh + (size_t)k * D;
+                    for (int v = 0; v < D; ++v) kv_mem[v] += Srow[v] * kv;
+                }
+                for (int v = 0; v < D; ++v) delta[v] = (v_buf[v] - kv_mem[v]) * beta_t;
+                for (int k = 0; k < D; ++k) {
+                    const float kv = k_buf[k];
+                    float *Srow = S_bh + (size_t)k * D;
+                    for (int v = 0; v < D; ++v) Srow[v] += kv * delta[v];
+                }
+                float *out_t = out + ((size_t)b * T + t) * H * D + (size_t)h * D;
+                for (int d = 0; d < D; ++d) out_t[d] = 0.0f;
+                for (int k = 0; k < D; ++k) {
+                    const float qv = q_buf[k];
+                    const float *Srow = S_bh + (size_t)k * D;
+                    for (int v = 0; v < D; ++v) out_t[v] += Srow[v] * qv;
+                }
+            }
+        }
+    }
+
+    free(post);
+}
+
+
+/* ---------------------------------------------------------------------------
  * gdr_kernel_v2 — gated-delta-rule recurrence with absorbed input prep.
  *
  *   mixed_qkv  [B, T, key_dim*2 + value_dim]   fp32   post-conv1d split source

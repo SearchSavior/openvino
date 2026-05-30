@@ -24,6 +24,24 @@ void gdr_kernel_v2(const float *mixed_qkv,
                    int B, int H, int T, int D,
                    int key_dim, int value_dim);
 
+/* gdr_kernel_v3: v2 + absorbs conv1d-with-state + SiLU + Transpose chain.
+ *   mixed_in   [B, T, C]   (in_proj_qkv MatMul output, no transpose)
+ *   conv_w     [C, K]      depthwise weights
+ *   prev_conv  [B, C, K-1] conv state in
+ *   g, beta    [B, T, H]
+ *   S          [B, H, D, D] in/out
+ *   out        [B, T, H, D]
+ *   new_conv   [B, C, K-1] conv state out
+ */
+void gdr_kernel_v3(const float *mixed_in,
+                   const float *conv_w,
+                   const float *prev_conv,
+                   const float *g, const float *beta,
+                   float *S, float *out, float *new_conv,
+                   int B, int H, int T, int D,
+                   int C, int K_conv,
+                   int key_dim, int value_dim);
+
 void conv1d_kernel(const float *prev, const float *cur, const float *w,
                    float *out, float *new_state,
                    int B, int C, int KS, int T, int K);
