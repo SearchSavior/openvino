@@ -39,6 +39,7 @@ set(SRC
     ${CMAKE_CURRENT_SOURCE_DIR}/../kernels/kernels.c
     gated_delta_rule.cpp
     gated_delta_rule_v2.cpp
+    gated_delta_rule_v3.cpp
     fused_causal_conv1d.cpp
     quantized_kv_cache.cpp
     quantized_kv_cache_update.cpp
