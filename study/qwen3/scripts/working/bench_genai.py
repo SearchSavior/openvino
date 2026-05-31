@@ -1,37 +1,37 @@
-"""End-to-end genai *vision-language* bench of v1 / v2 / v3 custom-op fusions.
+"""Single-config genai vision-language bench for one fusion variant.
 
-Unlike bench_v2 / bench_v3 (which drive the raw ov.Core() infer-request loop
-on the language model alone and need the serialize/reload trick so the C++ .so
-wins evaluate over the Python Op subclass), this script goes through the
-high-level `ov_genai.VLMPipeline(fused_dir, "CPU", extensions=[so])` API and
-feeds a real **image** so the full multimodal path runs:
+This script runs EXACTLY ONE configuration per process invocation. Run it
+repeatedly (once per config) from run_bench_genai.sh so every measurement
+gets a cold process: a fresh ov_genai Core, a freshly-wiped compile cache,
+and no leftover loaded-.so / weight-prepack state from a previous variant.
+(An in-process subprocess loop did not give clean isolation, hence the
+shell driver.)
 
+Configs:
+  baseline  stock VLMPipeline on the original model dir, NO rewrites, NO .so.
+            The reference: what a plain genai VLM user gets.
+  v1/v2/v3  rewrite the LM IR with the matching GatedDeltaRule fusion,
+            serialize a fused model dir, load with extensions=[so].
+
+genai's internal Core only ever sees the .so (no Python Op subclass in its
+namespace), so the C++ GatedDeltaRule{,V2,V3} implementation wins evaluate
+natively. The Python rewrites only construct+serialize the fused IR.
+
+The full multimodal path runs every time:
     image -> vision_embeddings -> merger -> [image tokens] + text tokens
-          -> language_model (with our fused GatedDeltaRule{,V2,V3} ops) -> text
+          -> language_model (fused ops for v1/v2/v3) -> text
 
-genai's internal Core only ever sees the .so — there is no Python `Op`
-subclass registered in its namespace — so the C++ implementation wins evaluate
-natively. The Python rewrites are used here only to *construct + serialize* the
-fused IR into a model dir; once it's on disk, genai reads it back and the
-extension factory resolves the custom op.
+Cache is rebuilt each run: CACHE_DIR is wiped before load, so the reported
+load time is a consistent cold compile+cache-build for every config.
 
-For each version we:
-  1. read the original LM IR, apply the matching rewrite, serialize into a
-     per-version fused dir (other model files symlinked from the original),
-  2. load through VLMPipeline(..., extensions=[so]),
-  3. generate from an image + question and read genai's PerfMetrics:
-       - TTFT  (time to first token ~= vision encode + prefill)
-       - throughput (generation tok/s)
-       - per-version load time.
-
-This is the apples-to-apples "would a genai VLM user actually see this?"
-number, as opposed to bench_v3's controlled text-only pp512/tg32 micro-bench.
-
-Run:
+Run one:
     cd study/qwen3
-    QWEN3_USE_C=1 python3 scripts/working/bench_genai.py [--image /path.png]
+    QWEN3_USE_C=1 python3 scripts/working/bench_genai.py --config v3
+Run all (recommended):
+    QWEN3_USE_C=1 bash scripts/working/run_bench_genai.sh
 """
 import argparse
+import shutil
 import sys
 import time
 from pathlib import Path
@@ -53,13 +53,14 @@ from lm_head_slice import slice_lm_head_to_last_token
 ORIG = Path("/tmp/qwen3-work/qwen35-0.8b-int8")
 SO_PATH = Path(__file__).resolve().parents[2] / "cpp_ext/build/libqwen3_ov_ext.so"
 WORK = Path("/tmp/qwen3-work")
+CACHE_DIR = WORK / "genai-cache"
 
 LM_FILES = {"openvino_language_model.xml", "openvino_language_model.bin"}
 
 REWRITE = {
-    1: replace_gated_delta_rule_loops,
-    2: replace_gated_delta_rule_loops_v2,
-    3: replace_gated_delta_rule_loops_v3,
+    "v1": replace_gated_delta_rule_loops,
+    "v2": replace_gated_delta_rule_loops_v2,
+    "v3": replace_gated_delta_rule_loops_v3,
 }
 
 # Vision-language prompt. The image tokens dominate the prefill; the question
@@ -76,10 +77,10 @@ def load_image(path):
     return ov.Tensor(arr)
 
 
-def make_fused_dir(version):
-    """Build a per-version fused model dir; symlink everything but the LM,
+def make_fused_dir(config):
+    """Build a per-config fused model dir; symlink everything but the LM,
     then serialize the rewritten LM into it. Returns the dir path."""
-    fused = WORK / f"qwen35-0.8b-int8-fused-v{version}"
+    fused = WORK / f"qwen35-0.8b-int8-fused-{config}"
     fused.mkdir(parents=True, exist_ok=True)
     for f in ORIG.iterdir():
         if f.name in LM_FILES:
@@ -90,27 +91,58 @@ def make_fused_dir(version):
         dst.symlink_to(f, target_is_directory=f.is_dir())
 
     model = ov.Core().read_model(str(ORIG / "openvino_language_model.xml"))
-    n = REWRITE[version](model)
+    n = REWRITE[config](model)
     ok = slice_lm_head_to_last_token(model)
-    print(f"  v{version} rewrites: replaced={n}  lm_head_slice={ok}")
+    print(f"  rewrites: replaced={n}  lm_head_slice={ok}")
     ov.serialize(model, str(fused / "openvino_language_model.xml"),
                  str(fused / "openvino_language_model.bin"))
     return fused
 
 
-def bench(version, image, max_new_tokens=32):
-    fused = make_fused_dir(version)
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--config", required=True, choices=["baseline", "v1", "v2", "v3"])
+    ap.add_argument("--image", default=DEFAULT_IMAGE)
+    ap.add_argument("--max-new-tokens", type=int, default=32)
+    ap.add_argument("--threads", type=int, default=4)
+    args = ap.parse_args()
+
+    print(f"openvino={ov.__version__}  openvino_genai={ov_genai.__version__}")
+    print(f"config={args.config}  image={args.image}")
+    if not Path(args.image).exists():
+        sys.exit(f"missing image {args.image} — pass --image <path>")
+
+    # Rebuild the compile cache each run for a consistent cold load time.
+    if CACHE_DIR.exists():
+        shutil.rmtree(CACHE_DIR)
+    CACHE_DIR.mkdir(parents=True, exist_ok=True)
+
+    # Resolve model dir + extension args per config (duplicated on purpose).
+    if args.config == "baseline":
+        model_dir = ORIG
+        pipe_kwargs = {"CACHE_DIR": str(CACHE_DIR),
+                       "INFERENCE_NUM_THREADS": args.threads}
+        print("  (stock VLMPipeline, no rewrites, no extensions)")
+    else:
+        if not SO_PATH.exists():
+            sys.exit(f"missing {SO_PATH} — build cpp_ext first")
+        model_dir = make_fused_dir(args.config)
+        pipe_kwargs = {"CACHE_DIR": str(CACHE_DIR),
+                       "INFERENCE_NUM_THREADS": args.threads,
+                       "extensions": [str(SO_PATH)]}
+
+    image = load_image(args.image)
+    print(f"  image tensor={image.get_shape()}")
 
     cfg = ov_genai.GenerationConfig()
-    cfg.max_new_tokens = max_new_tokens
-    cfg.do_sample = False  # greedy, deterministic, comparable to bench_v3
+    cfg.max_new_tokens = args.max_new_tokens
+    cfg.do_sample = False  # greedy, deterministic
 
     t0 = time.time()
-    vlm = ov_genai.VLMPipeline(str(fused), "CPU", extensions=[str(SO_PATH)],
-                               INFERENCE_NUM_THREADS=4)
+    vlm = ov_genai.VLMPipeline(str(model_dir), "CPU", **pipe_kwargs)
     load_s = time.time() - t0
 
-    # warmup (also primes any lazy compile / weight-prepack + vision encode)
+    # warmup (primes weight-prepack + vision encode; cache already built above)
     vlm.generate(PROMPT, images=[image], generation_config=cfg)
 
     out = vlm.generate(PROMPT, images=[image], generation_config=cfg)
@@ -123,60 +155,16 @@ def bench(version, image, max_new_tokens=32):
     n_gen = pm.get_num_generated_tokens()
     gen_total = pm.get_generate_duration().mean / 1000.0
     text = str(out).strip().replace("\n", " ")
-    del vlm
 
-    print(f"\n=== v{version} (genai VLMPipeline + image + extensions=[.so]) ===")
-    print(f"  load:            {load_s:6.2f}s")
-    print(f"  input tokens:    {n_in}")
-    print(f"  generated:       {n_gen}")
-    print(f"  TTFT (vis+pp):   {ttft:6.3f}s  ({n_in/ttft:6.1f} tok/s)")
-    print(f"  decode TPOT:     {tpot:6.2f} ms/tok ({1000.0/tpot:5.2f} tok/s)")
-    print(f"  decode tput:     {tput:6.2f} tok/s")
-    print(f"  generate total:  {gen_total:6.2f}s")
-    print(f"  output: {text[:90]!r}")
-    return {"version": version, "load": load_s, "n_in": n_in, "n_gen": n_gen,
-            "ttft": ttft, "pp_tps": n_in / ttft, "tpot": tpot,
-            "tg_tps": tput, "gen_total": gen_total, "text": text}
-
-
-def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--image", default=DEFAULT_IMAGE)
-    args = ap.parse_args()
-
-    print(f"openvino={ov.__version__}")
-    print(f"openvino_genai={ov_genai.__version__}")
-    if not SO_PATH.exists():
-        sys.exit(f"missing {SO_PATH} — build cpp_ext first "
-                 f"(cd cpp_ext && cmake -B build -DCMAKE_BUILD_TYPE=Release && cmake --build build -j)")
-    if not Path(args.image).exists():
-        sys.exit(f"missing image {args.image} — pass --image <path>")
-
-    image = load_image(args.image)
-    print(f"image={args.image}  tensor={image.get_shape()}")
-    rows = [bench(v, image) for v in (1, 2, 3)]
-
-    print(f"\n{'='*78}\nSUMMARY (genai VLMPipeline, image+text, greedy, threads=4)\n{'='*78}")
-    print(f"{'metric':<22s} {'v1':>16s} {'v2':>16s} {'v3':>16s}")
-    for label, key, unit, fmt in [
-        ("load",            "load",      "s",     "{:.2f}"),
-        ("input tokens",    "n_in",      "",      "{:.0f}"),
-        ("TTFT prefill",    "ttft",      "s",     "{:.3f}"),
-        ("prefill tput",    "pp_tps",    "tok/s", "{:.1f}"),
-        ("decode TPOT",     "tpot",      "ms",    "{:.2f}"),
-        ("decode tput",     "tg_tps",    "tok/s", "{:.2f}"),
-        ("generate total",  "gen_total", "s",     "{:.2f}"),
-    ]:
-        row = f"  {label:<20s}"
-        for r in rows:
-            row += f" {fmt.format(r[key]):>10s} {unit:<5s}"
-        print(row)
-
-    same = len({r["text"] for r in rows}) == 1
-    print(f"\noutputs identical across versions: {same}")
-    if not same:
-        for r in rows:
-            print(f"  v{r['version']}: {r['text'][:80]!r}")
+    print(f"\n=== {args.config} (genai VLMPipeline + image) ===")
+    print(f"  load (cold cache): {load_s:6.2f}s")
+    print(f"  input tokens:      {n_in}")
+    print(f"  generated:         {n_gen}")
+    print(f"  TTFT (vis+pp):     {ttft:6.3f}s  ({n_in/ttft:6.1f} tok/s)")
+    print(f"  decode TPOT:       {tpot:6.2f} ms/tok ({1000.0/tpot:5.2f} tok/s)")
+    print(f"  decode tput:       {tput:6.2f} tok/s")
+    print(f"  generate total:    {gen_total:6.2f}s")
+    print(f"  output: {text[:100]!r}")
 
 
 if __name__ == "__main__":
