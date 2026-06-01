@@ -691,3 +691,81 @@ For everything else — speed, correctness, kernel design — the work in
 this branch already lands real wins (custom ops are faster than stock
 at the raw layer; `safe_combo` is +22.7 % prefill at neutral memory)
 and is portable across OpenVINO versions.
+
+---
+
+## 2026-06-01 (after fork sync): L1 is even smaller than I thought
+
+The latest release notes mention "Optimized IR read mode with
+independently managed constant buffers... Linux support added in this
+release." Searching `origin/master` finds the commit:
+`4be1f034 Add release/lazy load on linux using mmap (#35388)`
+(2026-05-08, five days before the 2026.3 tag, so it IS in our installed
+wheel).
+
+What it ships:
+
+- `ov::MappedMemory::hint_evict(offset, size)`
+  (`src/common/util/include/openvino/util/mmap_object.hpp:47`) —
+  Linux `madvise(MADV_DONTNEED)` on the mmap'd region.
+- `ov::AlignedBuffer::hint_evict()`
+  (`src/core/dev_api/openvino/runtime/aligned_buffer.hpp:73`) — wrapper.
+- `ov::wsh::Extension::hint_evict(ov::op::v0::Constant&)`
+  (`src/core/dev_api/openvino/core/weight_sharing_util.hpp:133`) — the
+  public API for plugins.
+
+What it does NOT ship: a call site in the CPU plugin. Only the GPU
+plugin calls `hint_evict`, at
+`src/plugins/intel_gpu/src/plugin/ops/constant.cpp:149`, after uploading
+constants to GPU memory.
+
+I verified empirically: with the 2026.3 wheel installed, toggling
+`ENABLE_MMAP=True/False` on the raw `ov.Core()` path leaves `File=0`
+in `smaps_rollup` either way (`probe_raw_breakdown.py`). The lazy /
+evict behaviour is wired through the GPU plugin only.
+
+### Revised L1 scope
+
+The "skip weight repack" patch is much smaller than I originally
+estimated. It is not a refactor of `prepareWeightsMemory`. It is one
+call:
+
+```cpp
+// In src/plugins/intel_cpu/src/nodes/executors/dnnl/dnnl_fullyconnected_primitive.cpp
+// just after the prepareWeightsMemory call at line 464:
+(void)utils::prepareWeightsMemory(originalWeightsDesc, weightsDesc,
+                                   memory.at(ARG_WEI), context,
+                                   useDynamicQuantization);
++ ov::wsh::Extension::hint_evict(*m_constOp);  // free the source mmap
+```
+
+Plus a header include and probably the analogous call in convolution /
+matmul primitives that also call `prepareWeightsMemory`.
+
+The risks are small:
+
+- Repackers for other primitives that share the same Constant need to
+  finish before the evict. The clean way to ship this is a refcount,
+  or a deferred evict pass that walks all `Input` nodes at the end of
+  `compile_model`.
+- If a later transformation re-reads the original buffer (rare in our
+  workload), eviction forces a page-in. Latency cost, not correctness.
+
+If the patch lands, the original mmap pages move from anonymous (counts
+against RSS, blocks reuse) to file-backed (shared with the page cache,
+revictable under memory pressure). On our workload that recovers the
+~720 MiB anonymous weights copy.
+
+Projected reach: VmHWM 1955 → ~1235 MiB on our 770pp + 32tg measurement.
+~280 MiB short of llama.cpp's 953 MiB, but ~70 % of the gap closed for
+one call's worth of work. L2 (better activation aliasing) remains the
+lever for the rest.
+
+### Practical take
+
+The release note framing is honest: the 2026.3 release added the
+*infrastructure* for "independently managed constant buffers" on Linux.
+It just didn't connect the CPU plugin yet. The connecting patch is
+small enough to be a single-PR contribution. That's what the user
+should bring to whoever maintains
+`src/plugins/intel_cpu/src/nodes/executors/dnnl/`.
