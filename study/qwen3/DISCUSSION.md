@@ -769,3 +769,54 @@ It just didn't connect the CPU plugin yet. The connecting patch is
 small enough to be a single-PR contribution. That's what the user
 should bring to whoever maintains
 `src/plugins/intel_cpu/src/nodes/executors/dnnl/`.
+
+---
+
+## 2026-06-01 (proof): empirically demonstrating the L1 win
+
+`scripts/working/probe_manual_madvise.py` simulates the L1 patch from
+Python: it loads the model, runs one prefill at T=770, then walks
+`/proc/self/maps` to find every mmap'd range of the model `.bin` file
+and calls `madvise(MADV_DONTNEED)` on each. This is exactly what
+`ov::wsh::Extension::hint_evict` does inside the runtime; we're just
+invoking the kernel call from outside.
+
+Result:
+
+| stage                                | RSS (MiB) |
+|--------------------------------------|----------:|
+| pre-load                             |        52 |
+| after `compile_model`                |       164 |
+| after one prefill warmup at T=770    |   **2211**|
+| after `madvise(MADV_DONTNEED)` × 37  |   **1491**|
+| after a second prefill               |      1562 |
+
+The first `madvise` drops RSS by **720 MiB** immediately. A subsequent
+infer pulls a small fraction (~70 MiB) back in — presumably weights the
+plugin still touches via the source pointer rather than the packed
+copy. Steady state lands at ~1562 MiB.
+
+This proves the L1 win without writing a single line of C++. It also
+proves the risk: a subsequent infer DOES page some bytes back in, so a
+naive call site would force a partial re-mmap each step. The clean
+implementation calls `hint_evict` once, at the end of `compile_model`,
+after all primitive `prepareWeightsMemory` calls have completed and
+the packed copies are fully resident.
+
+Reach vs llama.cpp:
+
+| metric                       | OV today | OV + L1 (this proof) | llama.cpp |
+|------------------------------|---------:|---------------------:|----------:|
+| VmHWM @ T=770                | 2211 MiB |     **1562 MiB**     |  953 MiB  |
+| Gap to llama.cpp             |  +1258   |     **+609**         |     —     |
+
+The L1 call closes ~52 % of the gap. The remaining ~609 MiB is the
+compute buffer (anonymous activations from the per-layer
+[1, T, ×] tensors the MemorySolver couldn't fully pool), which is the
+L2 territory described earlier.
+
+`ENABLE_MMAP=True` (the default) is necessary for L1 to be possible —
+without mmap-backed weights, there's nothing for `hint_evict` to
+release. But `ENABLE_MMAP` toggle alone doesn't activate the saving;
+the missing piece is the CPU plugin calling `hint_evict`. That is the
+one-line patch.
