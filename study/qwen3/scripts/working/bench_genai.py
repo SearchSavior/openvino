@@ -1,33 +1,24 @@
 """Single-config genai vision-language bench for one fusion variant.
 
-This script runs EXACTLY ONE configuration per process invocation. Run it
-repeatedly (once per config) from run_bench_genai.sh so every measurement
-gets a cold process: a fresh ov_genai Core, a freshly-wiped compile cache,
-and no leftover loaded-.so / weight-prepack state from a previous variant.
-(An in-process subprocess loop did not give clean isolation, hence the
-shell driver.)
+Runs exactly ONE configuration per process invocation. Drive it from
+run_bench_genai.sh to sequence baseline/v1/v2/v3 in fresh processes; the
+compile cache (CACHE_DIR) is wiped before each load.
 
 Configs:
-  baseline  stock VLMPipeline on the original model dir, NO rewrites, NO .so.
-            The reference: what a plain genai VLM user gets.
+  baseline  stock VLMPipeline on the original model dir, no rewrites, no .so.
   v1/v2/v3  rewrite the LM IR with the matching GatedDeltaRule fusion,
             serialize a fused model dir, load with extensions=[so].
 
 genai's internal Core only ever sees the .so (no Python Op subclass in its
-namespace), so the C++ GatedDeltaRule{,V2,V3} implementation wins evaluate
-natively. The Python rewrites only construct+serialize the fused IR.
+namespace), so the C++ GatedDeltaRule{,V2,V3} implementation handles
+evaluate(). The Python rewrites only construct+serialize the fused IR.
 
-The full multimodal path runs every time:
-    image -> vision_embeddings -> merger -> [image tokens] + text tokens
-          -> language_model (fused ops for v1/v2/v3) -> text
-
-Cache is rebuilt each run: CACHE_DIR is wiped before load, so the reported
-load time is a consistent cold compile+cache-build for every config.
+Findings and interpretation live in DISCUSSION.md, not here.
 
 Run one:
     cd study/qwen3
     QWEN3_USE_C=1 python3 scripts/working/bench_genai.py --config v3
-Run all (recommended):
+Run all:
     QWEN3_USE_C=1 bash scripts/working/run_bench_genai.sh
 """
 import argparse
@@ -63,8 +54,6 @@ REWRITE = {
     "v3": replace_gated_delta_rule_loops_v3,
 }
 
-# Vision-language prompt. The image tokens dominate the prefill; the question
-# is short on purpose so TTFT reflects vision-encode + image-prefill cost.
 PROMPT = "Describe this image in one short sentence, then say who you are."
 DEFAULT_IMAGE = "/tmp/llama.cpp/media/llama1-logo.png"
 

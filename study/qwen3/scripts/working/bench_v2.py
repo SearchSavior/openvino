@@ -1,42 +1,12 @@
-"""pp512+tg32 with serialize/reload so the C++ extension actually wins evaluate().
+"""Build v1 + v2 fused IRs via the Python Op subclasses, serialize each,
+reload with a fresh Core+.so so the C++ implementation wins evaluate(),
+and run a chunked prefill + decode loop.
 
-When a Python `Op` subclass and the .so both register an op of the same name,
-the Python class's evaluate() always wins -- verified by patching the Python
-evaluate to print and seeing it called 18 times per step (one per linear-attn
-layer). To make the C++ extension actually run, serialize the constructed IR
-to disk and re-load it with a fresh ov.Core() that has only `add_extension(SO)`
-registered. That severs the Python-class binding and the C++ implementation
-takes over evaluate.
+Both versions are serialized then re-loaded by a fresh ov.Core() that has
+only the .so registered, severing the Python-class binding so the C++
+implementation handles evaluate.
 
-Last measured output (commit e554baa7, INFERENCE_NUM_THREADS=4, chunk=128):
-
-    === A. v1 (C++ ext) ===
-      activation budget @ T_q=128: 1153.4 MiB total
-        linear_attn        818.2 MiB
-        self_attn           66.1 MiB
-        mlp                 42.0 MiB
-        other              227.2 MiB
-      pp512: 5.02s (102.02 tok/s)
-      tg32:  2.66s (12.02 tok/s)
-
-    === B. v2 (C++ ext, mixed_qkv input) ===
-      activation budget @ T_q=128: 936.8 MiB total
-        linear_attn        601.6 MiB
-        self_attn           66.1 MiB
-        mlp                 42.0 MiB
-        other              227.2 MiB
-      pp512: 3.32s (154.18 tok/s)
-      tg32:  2.62s (12.22 tok/s)
-
-    SUMMARY (both via serialize/reload -> C++ ext)
-
-    metric                              A v1            B v2           delta
-      activation budget         1153.40 MiB      936.84 MiB     -216.56 MiB
-        linear_attn              818.16 MiB      601.59 MiB     -216.56 MiB
-      pp512 throughput           102.02 tok/s     154.18 tok/s     +52.16 tok/s
-      tg32 throughput             12.02 tok/s      12.22 tok/s      +0.20 tok/s
-      pp512 duration               5.02 s          3.32 s         -1.70 s
-      tg32 duration                2.66 s          2.62 s         -0.04 s
+Performance numbers and analysis live in DISCUSSION.md, not here.
 """
 import sys, time, os, subprocess, json
 import openvino as ov

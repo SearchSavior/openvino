@@ -1,25 +1,8 @@
-"""Why is VLMPipeline ~2x faster than our raw infer-request bench?
+"""Sweep prefill chunk size on baseline (no rewrites, no .so) and v3
+(custom .so) via raw ov.Core() infer-request. Reports best-of-3
+wall-clock per (version, chunk) cell.
 
-Hypothesis from reading genai sources (lm_encoding.cpp:183): VLMPipeline runs
-prefill as ONE m_llm.infer() call on the full prompt (780 tokens), while
-bench_v2/v3 chunked at 128. Four small infers should be slower than one big
-one because of:
-  - per-call dispatch overhead (×N),
-  - FC brgemm utilization at small M (×N short brgemm calls vs one tall one),
-  - for the custom op: per-call heap scratch alloc and state read/write (×N),
-  - oneDNN cache miss on the smaller shape.
-
-This script holds everything else constant and varies ONLY chunk size, on
-both baseline (no rewrites, no .so) and v3 (custom op .so), for prompt_len=512:
-
-    chunk=512   one-shot prefill           (what VLMPipeline effectively does)
-    chunk=256
-    chunk=128                              (what bench_v3.py does today)
-    chunk=64
-    chunk=32
-
-If the gap collapses at chunk=512, chunking is the whole story.
-If it persists, there's a separate VLMPipeline effect to chase.
+Findings and interpretation live in DISCUSSION.md, not here.
 
 Run:
     cd study/qwen3

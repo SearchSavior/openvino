@@ -1,0 +1,128 @@
+# Performance discussion — Qwen3.5-VL custom GatedDeltaRule ops
+
+This file is the **only** place perf numbers and interpretation live for
+the v1/v2/v3 work. Scripts, headers, kernels, and rewrites stay number-
+free; their comments only describe what the code does. Re-run the
+underlying scripts to refresh the tables here.
+
+---
+
+## 2026-06-01: corrected user-facing comparison (genai VLMPipeline, one-shot prefill)
+
+Source: `scripts/working/run_probe_pa_path.sh` (drives
+`probe_pa_path.py --version X --backend Y` once per cell, fresh process,
+wiped genai compile cache).
+
+Setup: Qwen3.5-VL-0.8B INT8, `INFERENCE_NUM_THREADS=4`, image
+`/tmp/llama.cpp/media/llama1-logo.png` (770 input tokens after vision
+encoder), greedy 32-token generation.
+
+| version  | backend                          | TTFT (s) | prefill (tok/s) | decode (tok/s) |
+|----------|----------------------------------|---------:|----------------:|---------------:|
+| baseline | PA  (genai default)              |  3.09    |       **249.1** |          17.80 |
+| baseline | SDPA                             |  9.77    |          78.8   |          15.72 |
+| v1       | PA  (silently falls back to SDPA)|  6.74    |         114.3   |          12.18 |
+| v1       | SDPA                             |  6.60    |         116.7   |          11.76 |
+| v2       | PA  (silently falls back to SDPA)|  6.88    |         112.0   |          11.35 |
+| v2       | SDPA                             |  6.46    |         119.1   |          12.09 |
+| v3       | PA  (silently falls back to SDPA)|  9.45    |          81.5   |          11.96 |
+| v3       | SDPA                             |  9.53    |          80.8   |          11.52 |
+
+### Reading the table
+
+1. **baseline PA vs baseline SDPA: ~3× prefill** (249 vs 79 tok/s). The default
+   `VLMPipeline` path is `PA_BACKEND` → `VLMContinuousBatchingAdapter`
+   (paged attention + continuous batching). Forcing `ATTENTION_BACKEND=SDPA`
+   downgrades to `VLMPipelineImpl` (stateful KV cache) and removes that
+   speedup.
+
+2. **All custom-op configs are on the SDPA path.** For v1/v2/v3 the PA and
+   SDPA rows match within noise. The paged-attention transformation pass
+   cannot rewrite our `GatedDeltaRule` op, the call throws, genai catches
+   it in `log_paged_attention_fallback` (`pipeline.cpp:875`), and the
+   pipeline re-loads through `VLMPipelineImpl`. So a user requesting
+   default `VLMPipeline` on the fused model never gets the PA fast path,
+   regardless of `ATTENTION_BACKEND`.
+
+3. **Under same backend (SDPA on both sides):**
+   - Prefill: v1 / v2 *exceed* baseline by ~48 % / 51 %. v3 is ~+3 %
+     vs baseline_sdpa.
+   - Decode: v1 / v2 / v3 are ~25–30 % slower than baseline_sdpa
+     (11.4–12.2 vs 15.7 tok/s).
+   - The v3 prefill flatness vs v1/v2 is the absorbed conv1d being on
+     the critical path of our scalar C kernel; v1/v2 leave the conv to
+     the plugin.
+
+4. **The earlier framing in `latest_memory.md` was misleading**:
+   - The chunked `pp512` numbers there (101 → 245 → 186 tok/s) were
+     `chunk=128` × 4 infer calls, not what any user-facing app does.
+     The honest user-facing number is the one above.
+   - The "v3 below llama.cpp compute buffer" claim mixed our paper-
+     budget walk (`get_runtime_model` × shape × dtype) with llama.cpp's
+     resident compute buffer. These aren't the same axis; until we
+     RSS-sample the running process we don't know the resident drop.
+   - The doc compared baseline (PA fast path) to custom configs (SDPA
+     fallback path), labelling the gap as kernel slowness when most of
+     it was the path difference.
+
+### What the gap actually is, today
+
+Under the only comparison we can do honestly (same backend, same prompt,
+same pipeline), the kernels we wrote are:
+
+- Faster than the stock CPU plugin's stateful linear-attn path on
+  prefill (v1/v2 substantially, v3 ~flat).
+- Slower on decode by ~25–30 %.
+- Locking the model onto the SDPA fallback by virtue of being present.
+
+The largest single performance lever remaining is **getting the custom
+op past `paged_attention_transformations`** so v1/v2/v3 can ride the
+PA path the stock model gets for free. That alone is a ~3× prefill
+swing; nothing in the kernel itself comes close.
+
+---
+
+## Memory: paper budget vs resident set (still unresolved)
+
+`scripts/working/investigate_runtime.py` walks `get_runtime_model()`,
+multiplies output shape × dtype, sums per bucket. This is **addressable**
+bytes — the sum of live tensors if storage couldn't be shared. The
+OpenVINO MemMgr pools and overlaps; resident memory is generally lower.
+
+The headline numbers in `latest_memory.md` (391 vs 687 MiB linear-attn
+activation) are paper budget. They are correct on that axis and v3
+absorbs the 162-MiB `[1,6144,128]` Transposed-mixed_qkv tensors, the
+111-MiB `[1,6144,132]` conv-concat tensors, and the 54-MiB `[1,6144,129]`
+conv outputs outright. That part is real.
+
+What is not real — without an RSS sampler — is the comparison to
+llama.cpp's 491 MiB **resident** compute buffer. To make that
+apples-to-apples we need:
+
+- Process-level RSS sampled around one prefill.
+- A `pmap` or `/proc/self/maps` rollup of allocations attributable to
+  inference vs weights.
+- Or oneDNN scratchpad accounting (`ONEDNN_VERBOSE=2` shows scratchpad
+  sizes per primitive).
+
+Until then, treat the −296 MiB / −383.5 MiB deltas as upper bounds on
+the resident savings.
+
+---
+
+## Open levers (not yet attempted)
+
+- Make `GatedDeltaRule{,V2,V3}` survive `paged_attention_transformations`,
+  or document the failure and propose a skip pattern.
+- The v3 decode cost is dominated by the per-call C kernel overhead
+  (state read + 18 invocations × one token). The fixed cost matters
+  more at T=1 than at T=770. Plausible mitigations:
+  - SIMD-blocked inner loop on the recurrence matmul.
+  - Hoist the state matmul out of the per-call C side and use OV
+    primitives for the state·k / state·q steps.
+- The `Slice|ref_f32` regression we measured in `investigate_runtime`
+  (9.8 → 18.3 ms in v3's linear_attn at T_q=128) deserves its own
+  investigation — the v3 rewrite must have introduced or grown some
+  dynamic slices on a hot path.
+
+Update: chasing these moved to the next session entry.

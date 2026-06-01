@@ -1,18 +1,14 @@
-"""Investigate WHERE baseline beats v3 — what primitives actually run, what
-activation tensors actually exist. No more guessing about 'blocked GEMM'.
+"""Compares baseline (no rewrites, no .so) vs v3 (full fusion + .so) with
+PERF_COUNT=True and reports:
 
-Compares baseline (no rewrites, no .so) vs v3 (full fusion + .so) on the same
-prompt+image, both compiled with PERF_COUNT=True, and reports:
+  1. Per-(op_type|exec_type) prefill time aggregated by layer bucket.
+  2. Runtime-model node counts per bucket.
+  3. Activation bytes on a bound shape (T_q=128) bucketed by sub-arch,
+     plus a per-(op_type, shape, dtype) rollup so individual tensor
+     classes are visible.
+  4. Per-call exec_time for the GatedDeltaRule custom op.
 
-  1. Per-implementation time on the LANGUAGE MODEL only (vision is identical).
-     Aggregates exec_time_us from get_profiling_info() bucketed by:
-        - layer sub-arch (linear_attn / self_attn / mlp / other)
-        - exec_type (jit_*, brgemm_*, ref, the custom op name, etc.)
-  2. Runtime-model node counts, also bucketed, so we can see what got
-     absorbed vs what's still in the graph.
-  3. Activation bytes on the same bound shape (T_q=128) bucketed by sub-arch.
-  4. Per-call exec_time for the GatedDeltaRule custom op (we have 18 of
-     them in v3) so we can quantify the kernel's overhead directly.
+Findings and interpretation live in DISCUSSION.md, not here.
 
 Run:
     cd study/qwen3

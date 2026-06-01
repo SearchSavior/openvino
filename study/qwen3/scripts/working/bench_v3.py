@@ -1,66 +1,9 @@
-"""pp512+tg32 comparing v1 / v2 / v3 with serialize/reload so the C++
-extension actually wins evaluate().
+"""Build v1/v2/v3 fused IRs via the Python Op subclasses, serialize each,
+reload with a fresh Core+.so so the C++ implementation wins evaluate(),
+and run a chunked prefill + decode loop. Reports activation byte rollup
+from get_runtime_model() and wall-clock throughput.
 
-v3 absorbs the conv1d-with-state + SiLU + Transposes chain in addition to
-what v2 absorbed (split / reshape / L2-norm / Q-scale / transpose). Goal:
-eliminate ~21 IR-level edge buffers per linear-attn layer, saving another
-~250-300 MiB of addressable activation memory beyond v2.
-
-See bench_v2.py for the serialize/reload pattern: the Python `Op` subclass
-takes priority over the .so when both register the same op name, so we
-serialize the IR after Python-class construction and re-load it with a
-fresh ov.Core() that has only the .so registered.
-
-Last measured output (this commit, INFERENCE_NUM_THREADS=4, chunk=128):
-
-    === A. v1 (C++ ext) ===
-      activation budget @ T_q=128: 687.4 MiB total
-        linear_attn        464.2 MiB
-        self_attn           33.1 MiB
-        mlp                 21.0 MiB
-        other              169.1 MiB
-      pp512: 5.07s (100.90 tok/s)
-      tg32:  2.04s (15.66 tok/s)
-
-    === B. v2 (+ split/L2/scale/transpose) ===
-      activation budget @ T_q=128: 579.1 MiB total
-        linear_attn        355.9 MiB
-        self_attn           33.1 MiB
-        mlp                 21.0 MiB
-        other              169.1 MiB
-      pp512: 2.09s (245.17 tok/s)
-      tg32:  2.02s (15.87 tok/s)
-
-    === C. v3 (+ conv1d/SiLU/Transposes) ===
-      activation budget @ T_q=128: 390.7 MiB total
-        linear_attn        164.2 MiB
-        self_attn           33.1 MiB
-        mlp                 21.0 MiB
-        other              172.5 MiB
-      pp512: 2.76s (185.59 tok/s)
-      tg32:  2.08s (15.39 tok/s)
-
-    SUMMARY (pp512 + tg32, chunk=128, threads=4, all via serialize/reload)
-    metric                              A v1            B v2            C v3
-      activation budget          687.35 MiB      579.07 MiB      390.70 MiB
-        linear_attn              464.20 MiB      355.92 MiB      164.18 MiB
-      pp512 throughput           100.90 tok/s     245.17 tok/s     185.59 tok/s
-      tg32 throughput             15.66 tok/s      15.87 tok/s      15.39 tok/s
-      pp512 duration               5.07 s          2.09 s          2.76 s
-      tg32 duration                2.04 s          2.02 s          2.08 s
-
-v3 vs v1:    -296 MiB activation (-43 %), -300 MiB linear_attn (-65 %),
-             +84 % prefill throughput, ~parity decode.
-v3 vs v2:    -188 MiB activation (-33 %), -192 MiB linear_attn (-54 %),
-             -24 % prefill (the absorbed conv1d kernel is less optimised than
-             the plugin's blocked GroupConvolution), parity decode.
-
-v3's 391 MiB total activation budget is *below* llama.cpp's measured 491 MiB
-compute buffer for the same workload. Per linear-attn layer: 25.8 MiB
-(v1) -> 9.1 MiB (v3), a ~65 % per-layer reduction.
-
-Generation identical to baseline: "I am Qwen3.5, the latest large language
-model developed by Tongyi Lab. I am a text-based AI model, so I don't".
+Performance numbers and analysis live in DISCUSSION.md, not here.
 """
 import sys, time
 import openvino as ov
