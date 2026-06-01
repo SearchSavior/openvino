@@ -216,10 +216,13 @@ def replace_gated_delta_rule_loops(model: ov.Model) -> int:
         g     = loop.input(5).get_source_output()
         beta  = loop.input(6).get_source_output()
         state = loop.input(7).get_source_output()
+        gd_assign = _find_gd_state_assign(loop.output(1))
         fused = GatedDeltaRule([q, k, v, g, beta, state])
         fused.set_friendly_name(loop.get_friendly_name() + "/Fused")
         loop.output(0).replace(fused.output(0))
         loop.output(1).replace(fused.output(1))
+        if gd_assign is not None:
+            gd_assign.input(0).replace_source_output(fused.output(1))
 
     return len(targets)
 
@@ -283,6 +286,7 @@ def replace_gated_delta_rule_loops_v2(model: ov.Model) -> int:
         beta_src = loop.input(6).get_source_output()
         state    = loop.input(7).get_source_output()
 
+        gd_assign = _find_gd_state_assign(loop.output(1))
         mixed_qkv = _find_mixed_qkv_for_q(q_src)
         if mixed_qkv is None:
             # couldn't find a [B, T, 6144] tensor above; fall back to v1.
@@ -293,6 +297,8 @@ def replace_gated_delta_rule_loops_v2(model: ov.Model) -> int:
             fused.set_friendly_name(loop.get_friendly_name() + "/Fused")
             loop.output(0).replace(fused.output(0))
             loop.output(1).replace(fused.output(1))
+            if gd_assign is not None:
+                gd_assign.input(0).replace_source_output(fused.output(1))
             replaced += 1
             continue
 
@@ -307,6 +313,8 @@ def replace_gated_delta_rule_loops_v2(model: ov.Model) -> int:
         out_BHTD = ops.transpose(fused.output(0), perm)
         loop.output(0).replace(out_BHTD.output(0))
         loop.output(1).replace(fused.output(1))
+        if gd_assign is not None:
+            gd_assign.input(0).replace_source_output(fused.output(1))
         replaced += 1
 
     return replaced
@@ -492,6 +500,33 @@ def _find_conv_state_assign(concat):
     return None, None
 
 
+def _find_gd_state_assign(loop_output1):
+    """The gated-delta state Assign is reached from the Loop's state output via
+    a PyTorch-export-pattern chain:
+        Loop.output(1) -> Reshape (flatten to 1D)
+                       -> Concat (combine with the per-T output reshape)
+                       -> Slice (drop the per-T prefix)
+                       -> Reshape (restore [B,H,D,D])
+                       -> Assign
+    Return the Assign node or None."""
+    visited = set()
+    def walk(out, depth):
+        if depth > 8: return None
+        for inp in out.get_target_inputs():
+            n = inp.get_node()
+            if n.get_friendly_name() in visited: continue
+            visited.add(n.get_friendly_name())
+            if n.get_type_name() == "Assign":
+                return n
+            if n.get_type_name() in {"Reshape", "Concat", "Slice"}:
+                for j in range(n.get_output_size()):
+                    res = walk(n.output(j), depth + 1)
+                    if res is not None:
+                        return res
+        return None
+    return walk(loop_output1, 0)
+
+
 def replace_gated_delta_rule_loops_v3(model: ov.Model) -> int:
     """Replace each gated-delta Loop with a v3 op that absorbs the conv1d-
     with-state + SiLU + Transposes + split / norm / scale / transpose chain.
@@ -534,11 +569,20 @@ def replace_gated_delta_rule_loops_v3(model: ov.Model) -> int:
                                 g_pre, beta_pre, state])
         v3.set_friendly_name(loop.get_friendly_name() + "/FusedV3")
 
+        # Find the gated-delta state Assign BEFORE replacing loop.output(1),
+        # since we walk forward from the loop's output to reach it.
+        gd_assign = _find_gd_state_assign(loop.output(1))
+
         # out [B, T, H, D] -> Transpose to [B, H, T, D] for the downstream
         perm = ops.constant(np.array([0, 2, 1, 3], dtype=np.int64))
         out_BHTD = ops.transpose(v3.output(0), perm)
         loop.output(0).replace(out_BHTD.output(0))
         loop.output(1).replace(v3.output(1))
+
+        # Bypass the PyTorch-export Reshape->Concat->Slice->Reshape chain on
+        # the new-state path: wire the Assign directly to v3.output(1).
+        if gd_assign is not None:
+            gd_assign.input(0).replace_source_output(v3.output(1))
 
         # Rewire the conv-state Assign to take v3.output(2)
         slice_node, conv_assign = _find_conv_state_assign(concat)

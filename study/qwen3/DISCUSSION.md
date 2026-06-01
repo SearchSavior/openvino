@@ -126,3 +126,65 @@ the resident savings.
   dynamic slices on a hot path.
 
 Update: chasing these moved to the next session entry.
+
+---
+
+## 2026-06-01 (later): close the decode kernel gap via state-Assign bypass
+
+`scripts/working/find_hot_slices.py` revealed that 18 nodes named
+`layers.X.linear_attn/aten::slice/Slice_4` (one per linear-attn layer)
+were each spending ~398 µs in `ref_f32` slicing a flat `[264192]` tensor
+down to `[262144]` — totalling **7.17 ms = 78 % of v3 linear_attn time
+at decode**.
+
+Tracing the IR with `scripts/working/find_slice_source.py` exposed why:
+the PyTorch export of the gated-delta Loop packs both outputs (per-T
+result + new state) into a single flat tensor via
+`Reshape -> Concat -> Slice -> Reshape -> Assign`. My v1/v2/v3 rewrites
+replaced `loop.output(1)` with `v3.output(1)` but left this whole chain
+alive, because the terminal `Assign` was reading through it.
+
+Fix in `kernels/fused_linear_attn.py`: a new helper
+`_find_gd_state_assign(loop.output(1))` walks the chain forward to the
+`Assign`, then each rewrite rewires `assign.input(0)` directly to
+`fused.output(1)`. The dead Reshape/Concat/Slice/Reshape nodes get
+pruned at compile time.
+
+Re-run of `run_probe_pa_path.sh` after the fix:
+
+| version  | backend | TTFT (s) | prefill (tok/s) | decode (tok/s) |
+|----------|---------|---------:|----------------:|---------------:|
+| baseline | PA      |   2.99   |       **257.2** |          17.56 |
+| baseline | SDPA    |  10.11   |          76.2   |          14.33 |
+| v1       | PA      |   7.02   |         109.7   |          14.76 |
+| v1       | SDPA    |   6.54   |         117.7   |          13.67 |
+| v2       | PA      |   6.79   |         113.3   |          15.08 |
+| v2       | SDPA    |   6.54   |         117.8   |    **15.79**   |
+| v3       | PA      |   9.16   |          84.0   |          14.51 |
+| v3       | SDPA    |   9.08   |          84.8   |          13.90 |
+
+### Same-backend (SDPA on both sides) comparison vs baseline_sdpa
+
+| version | prefill Δ | decode Δ |
+|---------|----------:|---------:|
+| v1      | **+54 %** |    −4.6 %|
+| v2      | **+55 %** |   **+10 %** |
+| v3      | **+11 %** |    −3.0 %|
+
+**The decode kernel gap is closed.** Before the fix all three custom
+configs were 23–28 % behind baseline_sdpa on decode. After: v2 beats
+baseline_sdpa, v1 and v3 are within ~5 % of it. v2 is the throughput
+sweet spot at both prefill and decode under the same backend.
+
+The PA fast-path gap (baseline_pa 257 vs v3_pa 84 tok/s prefill)
+remains — that lever is still about making the custom op survive
+`paged_attention_transformations`, not about kernel quality.
+
+### Lesson
+
+The "kernel gap" between baseline and v3 was mostly an IR-leftover
+problem, not a kernel-quality problem. A two-line fix in the rewrite
+(bypass a single Concat→Slice that an old PyTorch export emitted to
+pack two outputs into one Assign) reclaimed +21 %, +31 %, +21 % of
+decode for v1, v2, v3. Future fusion work should grep for similar
+"packed-output unpack" chains before assuming a perf gap is in C code.

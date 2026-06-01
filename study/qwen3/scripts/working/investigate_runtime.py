@@ -211,13 +211,18 @@ def compile_and_analyze(label, xml, with_ext, T_q=128):
 
 
 def main():
+    import argparse
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--T_q", type=int, default=128)
+    args = ap.parse_args()
+
     print("[1] building baseline (lm_head_slice only)…")
     xml_b = build_baseline_xml()
     print("[2] building v3 fusion IR…")
     xml_v = build_v3_xml()
 
-    rb = compile_and_analyze("BASELINE (stock plugin, no .so)", xml_b, with_ext=False)
-    rv = compile_and_analyze("V3 (custom .so, full fusion)", xml_v, with_ext=True)
+    rb = compile_and_analyze("BASELINE (stock plugin, no .so)", xml_b, with_ext=False, T_q=args.T_q)
+    rv = compile_and_analyze("V3 (custom .so, full fusion)", xml_v, with_ext=True,  T_q=args.T_q)
 
     print(f"\n{'='*78}\n## DELTA  v3 − baseline\n{'='*78}")
     print(f"  total activation:  {(rv['act_total']-rb['act_total'])/(1<<20):+.1f} MiB")
