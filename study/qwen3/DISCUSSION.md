@@ -1,0 +1,933 @@
+# Performance discussion — Qwen3.5-VL custom GatedDeltaRule ops
+
+This file is the **only** place perf numbers and interpretation live for
+the v1/v2/v3 work. Scripts, headers, kernels, and rewrites stay number-
+free; their comments only describe what the code does. Re-run the
+underlying scripts to refresh the tables here.
+
+---
+
+## 2026-06-01: corrected user-facing comparison (genai VLMPipeline, one-shot prefill)
+
+Source: `scripts/working/run_probe_pa_path.sh` (drives
+`probe_pa_path.py --version X --backend Y` once per cell, fresh process,
+wiped genai compile cache).
+
+Setup: Qwen3.5-VL-0.8B INT8, `INFERENCE_NUM_THREADS=4`, image
+`/tmp/llama.cpp/media/llama1-logo.png` (770 input tokens after vision
+encoder), greedy 32-token generation.
+
+| version  | backend                          | TTFT (s) | prefill (tok/s) | decode (tok/s) |
+|----------|----------------------------------|---------:|----------------:|---------------:|
+| baseline | PA  (genai default)              |  3.09    |       **249.1** |          17.80 |
+| baseline | SDPA                             |  9.77    |          78.8   |          15.72 |
+| v1       | PA  (silently falls back to SDPA)|  6.74    |         114.3   |          12.18 |
+| v1       | SDPA                             |  6.60    |         116.7   |          11.76 |
+| v2       | PA  (silently falls back to SDPA)|  6.88    |         112.0   |          11.35 |
+| v2       | SDPA                             |  6.46    |         119.1   |          12.09 |
+| v3       | PA  (silently falls back to SDPA)|  9.45    |          81.5   |          11.96 |
+| v3       | SDPA                             |  9.53    |          80.8   |          11.52 |
+
+### Reading the table
+
+1. **baseline PA vs baseline SDPA: ~3× prefill** (249 vs 79 tok/s). The default
+   `VLMPipeline` path is `PA_BACKEND` → `VLMContinuousBatchingAdapter`
+   (paged attention + continuous batching). Forcing `ATTENTION_BACKEND=SDPA`
+   downgrades to `VLMPipelineImpl` (stateful KV cache) and removes that
+   speedup.
+
+2. **All custom-op configs are on the SDPA path.** For v1/v2/v3 the PA and
+   SDPA rows match within noise. The paged-attention transformation pass
+   cannot rewrite our `GatedDeltaRule` op, the call throws, genai catches
+   it in `log_paged_attention_fallback` (`pipeline.cpp:875`), and the
+   pipeline re-loads through `VLMPipelineImpl`. So a user requesting
+   default `VLMPipeline` on the fused model never gets the PA fast path,
+   regardless of `ATTENTION_BACKEND`.
+
+3. **Under same backend (SDPA on both sides):**
+   - Prefill: v1 / v2 *exceed* baseline by ~48 % / 51 %. v3 is ~+3 %
+     vs baseline_sdpa.
+   - Decode: v1 / v2 / v3 are ~25–30 % slower than baseline_sdpa
+     (11.4–12.2 vs 15.7 tok/s).
+   - The v3 prefill flatness vs v1/v2 is the absorbed conv1d being on
+     the critical path of our scalar C kernel; v1/v2 leave the conv to
+     the plugin.
+
+4. **The earlier framing in `latest_memory.md` was misleading**:
+   - The chunked `pp512` numbers there (101 → 245 → 186 tok/s) were
+     `chunk=128` × 4 infer calls, not what any user-facing app does.
+     The honest user-facing number is the one above.
+   - The "v3 below llama.cpp compute buffer" claim mixed our paper-
+     budget walk (`get_runtime_model` × shape × dtype) with llama.cpp's
+     resident compute buffer. These aren't the same axis; until we
+     RSS-sample the running process we don't know the resident drop.
+   - The doc compared baseline (PA fast path) to custom configs (SDPA
+     fallback path), labelling the gap as kernel slowness when most of
+     it was the path difference.
+
+### What the gap actually is, today
+
+Under the only comparison we can do honestly (same backend, same prompt,
+same pipeline), the kernels we wrote are:
+
+- Faster than the stock CPU plugin's stateful linear-attn path on
+  prefill (v1/v2 substantially, v3 ~flat).
+- Slower on decode by ~25–30 %.
+- Locking the model onto the SDPA fallback by virtue of being present.
+
+The largest single performance lever remaining is **getting the custom
+op past `paged_attention_transformations`** so v1/v2/v3 can ride the
+PA path the stock model gets for free. That alone is a ~3× prefill
+swing; nothing in the kernel itself comes close.
+
+---
+
+## Memory: paper budget vs resident set (still unresolved)
+
+`scripts/working/investigate_runtime.py` walks `get_runtime_model()`,
+multiplies output shape × dtype, sums per bucket. This is **addressable**
+bytes — the sum of live tensors if storage couldn't be shared. The
+OpenVINO MemMgr pools and overlaps; resident memory is generally lower.
+
+The headline numbers in `latest_memory.md` (391 vs 687 MiB linear-attn
+activation) are paper budget. They are correct on that axis and v3
+absorbs the 162-MiB `[1,6144,128]` Transposed-mixed_qkv tensors, the
+111-MiB `[1,6144,132]` conv-concat tensors, and the 54-MiB `[1,6144,129]`
+conv outputs outright. That part is real.
+
+What is not real — without an RSS sampler — is the comparison to
+llama.cpp's 491 MiB **resident** compute buffer. To make that
+apples-to-apples we need:
+
+- Process-level RSS sampled around one prefill.
+- A `pmap` or `/proc/self/maps` rollup of allocations attributable to
+  inference vs weights.
+- Or oneDNN scratchpad accounting (`ONEDNN_VERBOSE=2` shows scratchpad
+  sizes per primitive).
+
+Until then, treat the −296 MiB / −383.5 MiB deltas as upper bounds on
+the resident savings.
+
+---
+
+## Open levers (not yet attempted)
+
+- Make `GatedDeltaRule{,V2,V3}` survive `paged_attention_transformations`,
+  or document the failure and propose a skip pattern.
+- The v3 decode cost is dominated by the per-call C kernel overhead
+  (state read + 18 invocations × one token). The fixed cost matters
+  more at T=1 than at T=770. Plausible mitigations:
+  - SIMD-blocked inner loop on the recurrence matmul.
+  - Hoist the state matmul out of the per-call C side and use OV
+    primitives for the state·k / state·q steps.
+- The `Slice|ref_f32` regression we measured in `investigate_runtime`
+  (9.8 → 18.3 ms in v3's linear_attn at T_q=128) deserves its own
+  investigation — the v3 rewrite must have introduced or grown some
+  dynamic slices on a hot path.
+
+Update: chasing these moved to the next session entry.
+
+---
+
+## 2026-06-01 (later): close the decode kernel gap via state-Assign bypass
+
+`scripts/working/find_hot_slices.py` revealed that 18 nodes named
+`layers.X.linear_attn/aten::slice/Slice_4` (one per linear-attn layer)
+were each spending ~398 µs in `ref_f32` slicing a flat `[264192]` tensor
+down to `[262144]` — totalling **7.17 ms = 78 % of v3 linear_attn time
+at decode**.
+
+Tracing the IR with `scripts/working/find_slice_source.py` exposed why:
+the PyTorch export of the gated-delta Loop packs both outputs (per-T
+result + new state) into a single flat tensor via
+`Reshape -> Concat -> Slice -> Reshape -> Assign`. My v1/v2/v3 rewrites
+replaced `loop.output(1)` with `v3.output(1)` but left this whole chain
+alive, because the terminal `Assign` was reading through it.
+
+Fix in `kernels/fused_linear_attn.py`: a new helper
+`_find_gd_state_assign(loop.output(1))` walks the chain forward to the
+`Assign`, then each rewrite rewires `assign.input(0)` directly to
+`fused.output(1)`. The dead Reshape/Concat/Slice/Reshape nodes get
+pruned at compile time.
+
+Re-run of `run_probe_pa_path.sh` after the fix:
+
+| version  | backend | TTFT (s) | prefill (tok/s) | decode (tok/s) |
+|----------|---------|---------:|----------------:|---------------:|
+| baseline | PA      |   2.99   |       **257.2** |          17.56 |
+| baseline | SDPA    |  10.11   |          76.2   |          14.33 |
+| v1       | PA      |   7.02   |         109.7   |          14.76 |
+| v1       | SDPA    |   6.54   |         117.7   |          13.67 |
+| v2       | PA      |   6.79   |         113.3   |          15.08 |
+| v2       | SDPA    |   6.54   |         117.8   |    **15.79**   |
+| v3       | PA      |   9.16   |          84.0   |          14.51 |
+| v3       | SDPA    |   9.08   |          84.8   |          13.90 |
+
+### Same-backend (SDPA on both sides) comparison vs baseline_sdpa
+
+| version | prefill Δ | decode Δ |
+|---------|----------:|---------:|
+| v1      | **+54 %** |    −4.6 %|
+| v2      | **+55 %** |   **+10 %** |
+| v3      | **+11 %** |    −3.0 %|
+
+**The decode kernel gap is closed.** Before the fix all three custom
+configs were 23–28 % behind baseline_sdpa on decode. After: v2 beats
+baseline_sdpa, v1 and v3 are within ~5 % of it. v2 is the throughput
+sweet spot at both prefill and decode under the same backend.
+
+The PA fast-path gap (baseline_pa 257 vs v3_pa 84 tok/s prefill)
+remains — that lever is still about making the custom op survive
+`paged_attention_transformations`, not about kernel quality.
+
+### Lesson
+
+The "kernel gap" between baseline and v3 was mostly an IR-leftover
+problem, not a kernel-quality problem. A two-line fix in the rewrite
+(bypass a single Concat→Slice that an old PyTorch export emitted to
+pack two outputs into one Assign) reclaimed +21 %, +31 %, +21 % of
+decode for v1, v2, v3. Future fusion work should grep for similar
+"packed-output unpack" chains before assuming a perf gap is in C code.
+
+---
+
+## 2026-06-01 (later still): the memory finding the earlier benches missed
+
+The probe was missing a memory column entirely. `probe_pa_path.py` now
+samples `/proc/self/status` (VmRSS via a background thread, VmHWM at
+end) around `VLMPipeline.generate()`. The rewrite + serialize step is
+forked into a subprocess so it does not leave its own peak RSS in the
+parent process.
+
+VmHWM (resident high-water mark) at 770 input tokens, 32-token greedy:
+
+| version  | backend | VmHWM (MiB) |
+|----------|---------|------------:|
+| baseline | PA      |   **2967**  |
+| baseline | SDPA    |     3229    |
+| v1       | PA      |     3473    |
+| v1       | SDPA    |     3670    |
+| v2       | PA      |     3652    |
+| v2       | SDPA    |     3853    |
+| v3       | PA      |     3408    |
+| v3       | SDPA    |     3608    |
+
+### Same-backend comparison (SDPA on both sides) — vs baseline_sdpa
+
+| version | VmHWM Δ |
+|---------|--------:|
+| v1      | +441 MiB |
+| v2      | +624 MiB |
+| v3      | +379 MiB |
+
+**This contradicts the paper-budget headline of `latest_memory.md`.**
+Under apples-to-apples backend, every custom-op config uses *more*
+resident memory than stock. The earlier "v3 saves 296 MiB activation
+vs v1, beats llama.cpp's 491 MiB compute buffer" framing compared a
+`get_runtime_model()` shape-by-dtype walk to llama.cpp's resident
+compute buffer. Different axes. The actual resident-set winner is
+**baseline_pa at 2967 MiB**.
+
+Among the custom configs v3 is the smallest (−62 MiB vs v1, −245 MiB
+vs v2), so the v1→v3 progression *does* monotonically improve our
+own footprint. But that progression never crossed under stock's curve.
+
+### Where the regression likely lives
+
+- The `.so` itself, its libgomp/jit globals, and the ctypes plumbing.
+- Per-call heap scratch in `gdr_kernel_v3` (~3 MiB × 18 layers ≈ 54 MiB,
+  not enough on its own).
+- OpenVINO's MemMgr can pool tensors aggressively around its own
+  primitives but treats the boundary of a custom op as opaque — the
+  state and output tensors of our op cannot share storage with
+  surrounding compute the way plugin nodes do. That is the most
+  plausible source of the rest.
+
+### PA path is also more memory-efficient
+
+- baseline: PA 2967 vs SDPA 3229 → **−262 MiB**
+- v3:       PA 3408 vs SDPA 3608 → **−200 MiB**
+
+So getting the custom op past `paged_attention_transformations` would
+buy both the prefill throughput AND a ~200 MiB resident win.
+
+### Lessons (compounding)
+
+1. **Measure RSS, not paper budget.** A `get_runtime_model()` shape
+   sum is what the plugin would allocate if it couldn't share. It can.
+   The two numbers can move in opposite directions.
+2. **Always fork the prep.** Any model-rewrite step that allocates
+   inside the measurement process inflates the baseline; subprocess
+   isolation gives a number you can trust.
+3. The earlier `latest_memory.md` 391-vs-491-MiB claim should be
+   retracted; the actual peak resident memory comparison is the one
+   above and stock wins on its own backend.
+
+---
+
+## 2026-06-01 (still later): raw ov.Core() probe — is the regression genai?
+
+`scripts/working/probe_raw.py` + `run_probe_raw.sh` repeat the
+770-token one-shot prefill + 32-token decode at the raw `ov.Core()`
+layer, no `ov_genai.VLMPipeline` involved. Subprocess prep for v1/v2/v3,
+same RSS sampler, same THREADS=4.
+
+| version  | prefill (tok/s) | decode (tok/s) | VmHWM (MiB) |
+|----------|----------------:|---------------:|------------:|
+| baseline |          113.6  |         14.01  |  **2248**   |
+| v1       |          189.6  |         15.19  |    2706     |
+| v2       |          186.6  |         15.72  |    2885     |
+| v3       |          114.4  |         15.27  |    2648     |
+
+### Compute (raw layer, same backend on both sides)
+
+| version | prefill Δ vs baseline | decode Δ vs baseline |
+|---------|----------------------:|---------------------:|
+| v1      | **+67 %**             | **+8.4 %**           |
+| v2      | **+64 %**             | **+12.2 %**          |
+| v3      | +0.7 %                | **+9.0 %**           |
+
+All three fusions are now strictly faster than stock at both prefill and
+decode at the raw layer. v3 trades almost all prefill back for the
+absorbed conv1d but holds the decode win.
+
+### Memory (raw layer)
+
+| version | VmHWM Δ vs baseline |
+|---------|--------------------:|
+| v1      |             +458 MiB |
+| v2      |             +637 MiB |
+| v3      |             +400 MiB |
+
+Compared to the genai-SDPA matrix (+441 / +624 / +379), the raw and
+genai deltas are within ±20 MiB of each other. **The memory regression
+is structural to the custom-op boundary, not a genai-pipeline artifact.**
+
+### Genai's own overhead, as a side product
+
+| metric          | raw baseline | genai baseline_pa | genai baseline_sdpa |
+|-----------------|-------------:|------------------:|--------------------:|
+| VmHWM           |    2248 MiB  |          2967 MiB |            3229 MiB |
+| genai overhead  |       —      |         **+719**  |          **+981**   |
+
+A genai user pays ~720 MiB just for the VLM machinery on top of the LM
+(tokenizer + detokenizer + vision encoder + merger + embed + sampler +
+PA block manager). The custom-op fusion adds another ~400 MiB on top.
+
+### Honest end-to-end summary
+
+- **Compute (kernels):** v1/v2/v3 are faster than stock at the raw
+  layer on both prefill and decode. v2 wins.
+- **Memory (resident):** v1/v2/v3 are +400–637 MiB worse than stock at
+  both raw and pipeline layers. v3 is the smallest of the customs.
+- **Pipeline overhead:** ~+720–980 MiB for genai's VLM stack on top of
+  whatever the LM weighs, independent of fusion choice.
+
+The interesting open question is not "are our kernels fast" — they are
+— but "why can't the plugin pool storage around our custom op the way
+it pools around its own primitives", and "can a partial absorption
+(keep more of the fused chain as plugin ops) keep the speed and recover
+the memory".
+
+---
+
+## 2026-06-01 (still later): llama.cpp parity attempt
+
+Goal: get the OV-side resident memory down to llama.cpp's footprint on
+the same workload (Qwen3.5-0.8B int8-equivalent, 770pp + 32tg, 4 threads).
+
+`/usr/bin/time -v llama-bench -m /tmp/qwen35-0.8b-Q8_0.gguf -p 770 -n 32 -t 4 -r 1`
+gives `Maximum resident set size: 976396 KiB` → **953 MiB total RSS**.
+
+For comparison the raw-OV baseline measured earlier is **2248 MiB**.
+Gap = **1295 MiB**, larger than anything fusion can move.
+
+### Knob sweep (raw ov.Core(), baseline LM, prompt_len=770)
+
+`scripts/working/run_probe_raw_lowmem.sh` drives one config per fresh
+process, each with the same RSS sampler. Best results:
+
+| config                       | VmHWM (MiB) | prefill (tok/s) | decode (tok/s) |
+|------------------------------|------------:|----------------:|---------------:|
+| default                      |       2250  |          116.4  |          15.35 |
+| INFERENCE_PRECISION_HINT=bf16|       2060  |           92.9  |          13.41 |
+| bf16 + u8 KV + latency + …   |   **2058**  |          105.9  |          13.49 |
+| (v3 fusion, default knobs)   |       2648  |          114.4  |          15.27 |
+| **llama.cpp Q8_0 reference** |     **953** |              —  |              — |
+
+`INFERENCE_PRECISION_HINT=bf16` is the only knob worth ~190 MiB. KV-cache
+u8, single stream, latency hint, dynamic-quant groups all move VmHWM by
+≤4 MiB. The combo of every memory-leaning knob lands at 2058 MiB —
+still **+1105 MiB over llama.cpp**.
+
+### Why the gap is structural
+
+`scripts/working/probe_raw_breakdown.py` reads `/proc/self/smaps_rollup`
+before and after warmup at T ∈ {32, 128, 512, 770}:
+
+|  T  | VmHWM (MiB) | smaps File-backed | smaps Anonymous |
+|-----|------------:|------------------:|----------------:|
+|  32 |       1670  |             0 MiB |       886 MiB   |
+| 128 |       1746  |             0 MiB |       962 MiB   |
+| 512 |       2033  |             0 MiB |      1248 MiB   |
+| 770 |       2212  |             0 MiB |      1427 MiB   |
+
+Two facts that close the explanation:
+
+1. **`File-backed = 0` everywhere.** OV's `ENABLE_MMAP=True` is on by
+   default and does mmap the IR for *reading*, but compile_model copies
+   the weights into anonymous memory (for weight repack / prepack /
+   format conversion). llama.cpp mmaps the GGUF and keeps it
+   file-backed through inference, so those ~720 MiB of weights sit in
+   the page cache (shared, not counted against RSS).
+2. **The compute buffer scales linearly with T** at ~0.73 MiB/token, on
+   top of a ~1500 MiB fixed cost at T=32. llama.cpp's total RSS at
+   T=770 is 953 MiB — *less than OV's compute buffer alone at T=32*.
+
+Roughly attributing the gap:
+- ~720 MiB: OV's anonymous-copy of weights vs llama.cpp's mmap'd GGUF.
+- ~400 MiB: larger fixed compute buffer (oneDNN scratchpads, runtime
+  graph structures, JIT cache).
+- compute buffer growth with T diverges further at larger prompts.
+
+### Implications for the v1/v2/v3 fusion work
+
+Fusion was a kernel/activation lever. It is not the right tool for this
+gap — at best it touches a single-digit-percent of the compute buffer,
+and v3 in particular shows up as a +400 MiB regression (custom-op
+boundary defeats the pool) on top of an already-+1295 MiB-over-llama.cpp
+baseline.
+
+If the goal is llama.cpp parity, the levers are:
+- Get OV to keep weights file-backed through compile (engine-level work
+  in the CPU plugin's transformation passes — non-trivial).
+- Use a backend with smaller fixed compute buffer (NPU? GPU has its own
+  memory; CPU plugin is the largest).
+- Switch engines for this workload.
+
+The fusion work delivers real **compute** wins (v1/v2/v3 all faster
+than stock on prefill and decode at the raw layer) and a +400 MiB
+**memory** regression. It is not in the path of llama.cpp parity.
+
+### Open question
+
+Whether OV exposes a per-`compile_model` flag that prevents weight
+repack (forcing native-int8 kernels at some perf cost) hasn't been
+found. The `SUPPORTED_PROPERTIES` enumeration on CPU includes
+`CPU_SPARSE_WEIGHTS_DECOMPRESSION_RATE`, `ENABLE_WEIGHTLESS`,
+`WEIGHTS_PATH` — none obviously match. If such a flag does not exist,
+closing the gap requires patching the CPU plugin.
+
+### Where the 0.73 MiB/token actually comes from
+
+A flag of `0.73 MiB/token` is too high for this architecture
+(6 self-attn + 18 linear-attn layers, hidden=1024, GQA). Architecturally
+the KV cache should grow at ~0.025 MiB/token (6 self-attn layers ×
+2 × kv_heads × head_dim × 4 bytes), and the 18 linear-attn layers
+should be O(1) per token (recurrent state has no T axis).
+
+`scripts/working/find_per_token_growth.py` walks `get_runtime_model()`
+at T=32 and T=770 and reports per-node Δbytes/token, bucketed:
+
+| bucket      | Σ paper Δ/token | T=770 paper | T=32 paper |
+|-------------|----------------:|------------:|-----------:|
+| linear_attn |        4.64 MiB |     3580 MiB|    152 MiB |
+| other       |        0.92 MiB |      711 MiB|     32 MiB |
+| self_attn   |        0.52 MiB |      397 MiB|     17 MiB |
+| mlp         |        0.33 MiB |      253 MiB|     11 MiB |
+| total paper |    **6.41 MiB** |   **4942**  |   **212**  |
+
+Versus actual measured RSS Δ/token: **0.73 MiB**. So the plugin's pool
+recovers ~89 % of the paper budget. The remaining 0.73 is dominated by
+the linear_attn bucket.
+
+Per linear-attn layer the IR contains ~18 separate `[1, T, 6144]` f32
+buffers — every Transpose / Multiply / Reshape / Split / L2-norm
+output in PyTorch's eager-style decomposition is a distinct IR tensor.
+24 KiB/token × 18 nodes × 18 layers = ~7.6 MiB/token paper, close to
+the measured 4.64 (some nodes alias / share). After the pool: 0.73.
+
+**The architecture does not demand 0.73 MiB/token; the IR representation
+does.** The lever is to fuse more of the per-layer ops into a single
+primitive so the IR-level intermediate set collapses. But our v3
+fusion's custom-op boundary defeats the plugin's pool on its own
+outputs (worth +400 MiB at T=770), and that lost-pool cost is larger
+than the absorbed paper budget reclaim. Net: v3 RSS is worse than
+baseline.
+
+### What it would take to actually shrink resident memory
+
+- Fuse the entire linear-attn module into one custom op (eliminate the
+  18 × `[1, T, 6144]` intermediates from the IR), AND
+- Get the plugin's MemMgr to pool through that op's I/O the way it
+  pools through its own primitives. This is engine-level work in the
+  CPU plugin's memory allocator — declaring our op's outputs as
+  in-place-reusable, or marking input/output tensor descriptors as
+  alias-eligible.
+
+Without (2), absorbing more into the kernel makes resident memory
+*worse* by trading 89 %-poolable IR tensors for 0 %-poolable custom-op
+boundary tensors.
+
+---
+
+## 2026-06-01 (even later): can plugin-native IR rewrites shrink memory?
+
+Goal: reduce per-token IR-shape overhead without going through a custom
+op, so the plugin keeps full ownership of its pool. Implemented three
+rewrites in `kernels/reduce_ir.py`:
+
+1. **`reshape_before_split`** — replaces
+   `VariadicSplit(axis=-1) → 3 × Reshape` with
+   `Reshape → VariadicSplit(axis=-2)`. Intended to eliminate three
+   `[?, T, 2048]` intermediates per layer.
+2. **`fold_q_scale_into_rsqrt`** — folds the Q-path
+   `Multiply(rsqrt) → Transpose → Divide(by sqrt(D))` into
+   `Multiply(rsqrt × 1/sqrt(D)) → Transpose`. Intended to drop a
+   `[?, 16, T, 128]` Divide-output buffer per layer.
+3. **`fuse_l2_norm`** — collapses the 6-op L2-norm chain
+   `(Multiply x×x → ReduceSum → Add(ε) → Sqrt → Divide(1, _) → Multiply)`
+   into a single `NormalizeL2(x, axes, ε, ADD)`.
+
+Probe results (`probe_reduce_ir.py`, raw `ov.Core()`, 770pp+32tg, threads=4):
+
+| mode                              | VmHWM (MiB) | prefill (tok/s) | decode (tok/s) |
+|-----------------------------------|------------:|----------------:|---------------:|
+| baseline                          |     2248.3  |          108.2  |          14.48 |
+| presplit_only                     |     2250.7  |          102.1  |          15.33 |
+| qscale_only                       |     2406.0  |           89.2  |          15.27 |
+| l2norm_only                       |     2250.5  |          117.8  |          13.73 |
+| **safe_combo** (presplit+l2norm)  | **2250.8**  | **132.8** (+22.7 %) | 14.55 |
+| reduced (all three)               |     2404.6  |          102.7  |          16.39 |
+
+### Findings
+
+1. **None of the plugin-native rewrites shrink resident memory.** The
+   floor sits at ~2250 MiB regardless. `presplit` is neutral (the
+   plugin already aliases the original `VariadicSplit` on the last
+   contiguous axis; rewriting to split on `axis=-2` after a 4D reshape
+   forces a non-aliasable split that exactly cancels the eliminated
+   `[?, T, 2048]` buffers). `l2norm` is neutral (NormalizeL2 uses
+   comparable scratch to the manual chain).
+2. **`qscale_only` makes memory worse by +158 MiB.** Removing the
+   `Divide` step almost certainly defeats a postop fusion the plugin
+   was applying to the upstream Multiply / Transpose, costing more in
+   scratch than the eliminated tensor saved.
+3. **`presplit + l2norm` (the safe combo) is +23 % prefill at neutral
+   memory.** Real prefill win, zero memory move. Decode is flat.
+
+### Verdict
+
+Reducing IR tensor count from Python is not the path to memory
+reduction. The plugin already pools the per-layer
+`[1, T, 6144]` / `[1, T, 2048]` intermediates at ~89 % efficiency; the
+remaining 11 % is what we'd hope to eliminate, but the rewrites either
+move it (no net change) or break neighbouring fusions (net negative).
+
+For memory, the lever has to be inside the CPU plugin (keep weights
+file-backed through compile, or shrink the fixed compute buffer).
+The fusion work and the IR rewrites are both prefill wins, not memory
+wins.
+
+For prefill speed, the safe combo at +22.7 % is the best result in this
+work that does not regress anything else, and it stays fully inside the
+supported OpenVINO API.
+
+---
+
+## 2026-06-01 (final): scope of the C++ patches required for llama.cpp parity
+
+I traced the OV CPU plugin source to identify where the gap-causing
+allocations actually happen. Three levels, ordered by how local /
+contained each patch is.
+
+### Level 1: avoid weight repack into anonymous memory  ~720 MiB
+
+**Single function. Days of work. Real perf risk.**
+
+The flow today, two allocations per weight tensor:
+
+1. `Input::cloneBlobIfRequired()`
+   — `src/plugins/intel_cpu/src/nodes/input.cpp:420`
+   For int8 weights with no subnormals on a single-NUMA host, the
+   `clone_is_not_needed` branch (line 575) IS taken. That branch already
+   wraps the original Constant pointer directly without copying:
+   ```cpp
+   memoryPtr = std::make_shared<Memory>(getEngine(), memDesc, m_constOp->get_data_ptr());
+   ```
+   So on the IR-read side, no anonymous copy is forced.
+
+2. `prepareWeightsMemory(...)`
+   — `src/plugins/intel_cpu/src/nodes/executors/dnnl/dnnl_utils.cpp:30`
+   Called from `DnnlFCPrimitive::create()` at
+   `src/plugins/intel_cpu/src/nodes/executors/dnnl/dnnl_fullyconnected_primitive.cpp:464`.
+   It:
+   ```cpp
+   MemoryPtr _ptr = std::make_shared<Memory>(eng, dstWeightDesc);  // NEW anon alloc
+   node::Reorder::reorderData(srcMemory, *_ptr, rtCache, threadPool);
+   ```
+   This is where the second 720 MiB-class anonymous copy is born — the
+   packed/blocked layout DNNL's brgemm primitive wants. After this,
+   both the mmap'd original and the packed copy are live.
+
+   `ov.serialize` should produce a `.bin` that the next `read_model`
+   mmaps (`ENABLE_MMAP=True` is the default). Our smaps showed
+   `File=0`, so either the IR frontend is not actually keeping the
+   weight mmap file-backed past compile, or the `prepareWeightsMemory`
+   reorder is freeing the mmap reference before the packed copy lands.
+   The exact path warrants one more trace — but the eliminable bytes
+   are the **packed** copy regardless.
+
+   The patch ideas:
+   - **Force native-format weights** for brgemm-decompressed paths so
+     no repack is needed. The brgemm AMX/AVX-512 INT8 impls *can* take
+     plain row-major in some cases at a perf cost; need to check
+     `dnnl_fullyconnected_primitive.cpp:460-470` for whether
+     `weights_desc()` is queried from the primitive (DNNL chose the
+     packed layout) or specified by us. If it's the former, hard.
+   - **Reorder in-place** into the original mmap pages — requires the
+     mmap to be writable. `MAP_PRIVATE` would give us CoW pages which
+     end up anonymous anyway, defeating the point.
+   - **Stream-reorder** so the packed buffer is built one block at a
+     time and the original mmap pages can be freed/madvise-don't-need
+     incrementally. Cuts peak by ~700 MiB at compile time, no runtime
+     cost.
+
+   **Scope of edit**: One function in one file (`prepareWeightsMemory`),
+   plus possibly a flag plumbed through `DnnlFCPrimitive::create`. Best
+   case: 50–150 lines.
+   **Risk**: oneDNN's int8 brgemm impls in OV's vendored dnnl don't
+   uniformly support native-format weight. May force a slower fallback,
+   cutting prefill from 116 tok/s back toward 50–60 tok/s. Each impl
+   path would need a check + benchmark.
+
+### Level 2: shrink the activation block the MemorySolver hands out  ~300–500 MiB
+
+**Refactor of `MemoryControl` + a new transformation pass. Weeks.**
+
+The pool already recovers 89 % of the paper budget
+(4.6 → 0.5 MiB/token on linear_attn). The remaining 11 % is the cost
+of the per-layer eager-IR shape: every Transpose/Multiply/Reshape/Split
+in the PyTorch export is its own live tensor over a non-trivial
+interval, so the MemorySolver can't pack them tighter.
+
+Plugin-native rewrites (`scripts/working/probe_reduce_ir.py`) tried to
+cut tensor count from Python. Net effect: zero or negative on RSS
+because the original `VariadicSplit(axis=-1)` is already alias-able
+on the contiguous axis, and folding things like `Divide(by sqrt(D))`
+defeats existing postop fusions.
+
+Real options inside the plugin:
+
+- **Implement an in-place-pass that marks producer/consumer pairs as
+  alias-eligible at the `Edge` level.** Files involved:
+  `graph.cpp:761-895` (the allocation-cluster loop) and
+  `edge.cpp` (Edge alias plumbing). The challenge is making this
+  work for ops with non-trivial layout reorders between producer
+  and consumer.
+- **Add a transformation that converts the eager-style linear-attn
+  module into a smaller graph of broader primitives** (e.g. a
+  hypothetical `LinearAttentionPrep` op that consumes
+  `[B, T, hidden]` and emits `[B, H, T, D]` Q/K/V without intermediate
+  IR edges). This is closer to what we did with `GatedDeltaRule` but
+  *inside* the CPU plugin so MemMgr keeps ownership.
+
+  Files: a new pass under
+  `src/plugins/intel_cpu/src/transformations/cpu_opset/common/op/` and
+  a new node implementation under
+  `src/plugins/intel_cpu/src/nodes/`. ~500–1000 lines plus tests.
+
+### Level 3: cut activation precision from f32 to bf16/f16 through the layer  ~500 MiB
+
+**Engine-level rework. Months.**
+
+Even with `INFERENCE_PRECISION_HINT=bf16` set we only saw a 190 MiB
+drop. That's because the hint controls MatMul compute precision and a
+few jit kernels, not the full residual stream / RMSNorm / Mul / Add
+chain. The post-LN hidden state buffers stay f32, and so do many of
+the activation Reorders the plugin inserts between primitives.
+
+llama.cpp is f16 throughout the hidden state by default, which gives
+2× compression on the per-T activation buffers. Matching this in OV
+would mean:
+
+- Making all the `Multiply`, `Add`, `RMSNorm`, `Swish`, `Reshape`,
+  `Transpose`, `Concat`, `Slice` nodes in the residual-stream chain
+  produce bf16, not f32.
+- Auditing each oneDNN primitive's bf16-input/f32-output paths.
+- Handling the inevitable bf16-overflow checks (line 461-491 of
+  `input.cpp` already does this for weights; would need similar at
+  activation level).
+
+This is the path most of the runtime memory gap actually lives in.
+It's also the deepest. Probably not contained to a few files; you
+end up touching every common node's `prepareParams`.
+
+### Practical answer to "how low are these changes"
+
+| Level | Savings target | Files touched | LoC | Time | Perf risk |
+|-------|---------------:|---------------|-----|------|-----------|
+| L1: skip weight repack       | ~720 MiB | `dnnl_utils.cpp`, `dnnl_fullyconnected_primitive.cpp` | 50–150 | days | medium–high (slower brgemm fallback) |
+| L2: better activation aliasing | ~300–500 MiB | `memory_control.cpp`, `graph.cpp`, `edge.cpp`, new transformation pass | 500–1000 | weeks | low |
+| L3: bf16 residual stream     | ~500 MiB | many: every common node executor, validation passes | thousands | months | model-accuracy risk |
+
+L1 alone closes the gap to **~1500 MiB**. L1 + L2 → **~1100 MiB**.
+L1 + L2 + L3 → **~600 MiB**, below llama.cpp's 953 MiB.
+
+None of these are "low" by our `study/qwen3/scripts/working/` rewrite
+standards. They are all CPU-plugin commits, with the corresponding
+review burden.
+
+### Recommended next step
+
+If memory parity is the goal: spend two days on L1 with a benchmark
+guard rail (any prefill regression > 15 % blocks the patch). If the
+brgemm AMX impl accepts native-format int8 weights at acceptable
+speed, that's the entire 720 MiB win. If not, none of the higher
+levels are worth starting without a fundamentally different attack
+plan (different backend, weights-on-NPU, etc.).
+
+For everything else — speed, correctness, kernel design — the work in
+this branch already lands real wins (custom ops are faster than stock
+at the raw layer; `safe_combo` is +22.7 % prefill at neutral memory)
+and is portable across OpenVINO versions.
+
+---
+
+## 2026-06-01 (after fork sync): L1 is even smaller than I thought
+
+The latest release notes mention "Optimized IR read mode with
+independently managed constant buffers... Linux support added in this
+release." Searching `origin/master` finds the commit:
+`4be1f034 Add release/lazy load on linux using mmap (#35388)`
+(2026-05-08, five days before the 2026.3 tag, so it IS in our installed
+wheel).
+
+What it ships:
+
+- `ov::MappedMemory::hint_evict(offset, size)`
+  (`src/common/util/include/openvino/util/mmap_object.hpp:47`) —
+  Linux `madvise(MADV_DONTNEED)` on the mmap'd region.
+- `ov::AlignedBuffer::hint_evict()`
+  (`src/core/dev_api/openvino/runtime/aligned_buffer.hpp:73`) — wrapper.
+- `ov::wsh::Extension::hint_evict(ov::op::v0::Constant&)`
+  (`src/core/dev_api/openvino/core/weight_sharing_util.hpp:133`) — the
+  public API for plugins.
+
+What it does NOT ship: a call site in the CPU plugin. Only the GPU
+plugin calls `hint_evict`, at
+`src/plugins/intel_gpu/src/plugin/ops/constant.cpp:149`, after uploading
+constants to GPU memory.
+
+I verified empirically: with the 2026.3 wheel installed, toggling
+`ENABLE_MMAP=True/False` on the raw `ov.Core()` path leaves `File=0`
+in `smaps_rollup` either way (`probe_raw_breakdown.py`). The lazy /
+evict behaviour is wired through the GPU plugin only.
+
+### Revised L1 scope
+
+The "skip weight repack" patch is much smaller than I originally
+estimated. It is not a refactor of `prepareWeightsMemory`. It is one
+call:
+
+```cpp
+// In src/plugins/intel_cpu/src/nodes/executors/dnnl/dnnl_fullyconnected_primitive.cpp
+// just after the prepareWeightsMemory call at line 464:
+(void)utils::prepareWeightsMemory(originalWeightsDesc, weightsDesc,
+                                   memory.at(ARG_WEI), context,
+                                   useDynamicQuantization);
++ ov::wsh::Extension::hint_evict(*m_constOp);  // free the source mmap
+```
+
+Plus a header include and probably the analogous call in convolution /
+matmul primitives that also call `prepareWeightsMemory`.
+
+The risks are small:
+
+- Repackers for other primitives that share the same Constant need to
+  finish before the evict. The clean way to ship this is a refcount,
+  or a deferred evict pass that walks all `Input` nodes at the end of
+  `compile_model`.
+- If a later transformation re-reads the original buffer (rare in our
+  workload), eviction forces a page-in. Latency cost, not correctness.
+
+If the patch lands, the original mmap pages move from anonymous (counts
+against RSS, blocks reuse) to file-backed (shared with the page cache,
+revictable under memory pressure). On our workload that recovers the
+~720 MiB anonymous weights copy.
+
+Projected reach: VmHWM 1955 → ~1235 MiB on our 770pp + 32tg measurement.
+~280 MiB short of llama.cpp's 953 MiB, but ~70 % of the gap closed for
+one call's worth of work. L2 (better activation aliasing) remains the
+lever for the rest.
+
+### Practical take
+
+The release note framing is honest: the 2026.3 release added the
+*infrastructure* for "independently managed constant buffers" on Linux.
+It just didn't connect the CPU plugin yet. The connecting patch is
+small enough to be a single-PR contribution. That's what the user
+should bring to whoever maintains
+`src/plugins/intel_cpu/src/nodes/executors/dnnl/`.
+
+---
+
+## 2026-06-01 (proof): empirically demonstrating the L1 win
+
+`scripts/working/probe_manual_madvise.py` simulates the L1 patch from
+Python: it loads the model, runs one prefill at T=770, then walks
+`/proc/self/maps` to find every mmap'd range of the model `.bin` file
+and calls `madvise(MADV_DONTNEED)` on each. This is exactly what
+`ov::wsh::Extension::hint_evict` does inside the runtime; we're just
+invoking the kernel call from outside.
+
+Result:
+
+| stage                                | RSS (MiB) |
+|--------------------------------------|----------:|
+| pre-load                             |        52 |
+| after `compile_model`                |       164 |
+| after one prefill warmup at T=770    |   **2211**|
+| after `madvise(MADV_DONTNEED)` × 37  |   **1491**|
+| after a second prefill               |      1562 |
+
+The first `madvise` drops RSS by **720 MiB** immediately. A subsequent
+infer pulls a small fraction (~70 MiB) back in — presumably weights the
+plugin still touches via the source pointer rather than the packed
+copy. Steady state lands at ~1562 MiB.
+
+This proves the L1 win without writing a single line of C++. It also
+proves the risk: a subsequent infer DOES page some bytes back in, so a
+naive call site would force a partial re-mmap each step. The clean
+implementation calls `hint_evict` once, at the end of `compile_model`,
+after all primitive `prepareWeightsMemory` calls have completed and
+the packed copies are fully resident.
+
+Reach vs llama.cpp:
+
+| metric                       | OV today | OV + L1 (this proof) | llama.cpp |
+|------------------------------|---------:|---------------------:|----------:|
+| VmHWM @ T=770                | 2211 MiB |     **1562 MiB**     |  953 MiB  |
+| Gap to llama.cpp             |  +1258   |     **+609**         |     —     |
+
+The L1 call closes ~52 % of the gap. The remaining ~609 MiB is the
+compute buffer (anonymous activations from the per-layer
+[1, T, ×] tensors the MemorySolver couldn't fully pool), which is the
+L2 territory described earlier.
+
+`ENABLE_MMAP=True` (the default) is necessary for L1 to be possible —
+without mmap-backed weights, there's nothing for `hint_evict` to
+release. But `ENABLE_MMAP` toggle alone doesn't activate the saving;
+the missing piece is the CPU plugin calling `hint_evict`. That is the
+one-line patch.
+
+---
+
+## 2026-06-01 (8K context): the gap widens with T
+
+Driven by `scripts/working/run_llama_bench.py` (llama-bench wrapper with
+per-PID `/proc/<pid>/status` polling) and a one-off run of
+`scripts/working/probe_raw_breakdown.py --T 8192`.
+
+Same Qwen3.5-0.8B model, same 4 threads, same prompt-vs-decode workload
+(`pp8192 + tg32` for llama-bench; raw `ov.Core()` prefill at T=8192 +
+one decode step for OV).
+
+| metric                          | OV raw    | llama.cpp Q8_0 |
+|---------------------------------|----------:|---------------:|
+| peak RSS @ pp=770               |  2212 MiB |       953 MiB  |
+| peak RSS @ pp=8192              |**7848 MiB**|     **1220 MiB**|
+| per-token slope                 | +0.76 MiB |   +0.036 MiB   |
+| OV ÷ llama.cpp at T=770         |    2.3 ×  |       —        |
+| OV ÷ llama.cpp at T=8192        |  **6.4 ×**|       —        |
+
+**The gap widens with T**, by a factor of ~21 per token. At 8K context
+OV holds ~6.6 GiB more resident memory than llama.cpp for the same work.
+
+llama.cpp trajectory at pp=8192 (from `run_llama_bench.py` poll):
+
+```
+ t (s)   RSS (MiB)
+   0      0   (start)
+   1.8    1037 (post model-load)
+  50.0    1220 (peak hit during prefill)
+  50–104  1220 (flat through decode)
+  106     118  (cleanup)
+```
+
+The compute buffer + KV cache growth from post-load to peak is only
++183 MiB on llama.cpp. OV's compute buffer at the same T (post-compile
+164 MiB → warmup peak 7848 MiB) is **+7684 MiB**. That's ~42 × more
+compute buffer for the same workload.
+
+### What L1 actually buys at 8K (measured, not projected)
+
+Ran `probe_manual_madvise.py --T 8192`:
+
+| stage           | RSS (MiB) | Anonymous | Pss_File |
+|-----------------|----------:|----------:|---------:|
+| after warmup    |     7848  |    7064   |    782   |
+| after madvise   |   **7129**|    7064   |     63   |
+| **L1 delta**    |  **−720** | unchanged |  **−719**|
+
+So L1 *does* save 720 MiB at T=8192 — same absolute number as at T=770.
+That projection was correct.
+
+### What I was overconfident about: L2 closing the rest
+
+Earlier text said L2 (better activation aliasing) could close the
+remaining ~5.9 GiB gap. That was speculation, not measurement. Looking
+at the actual breakdown:
+
+| component                          | OV @ T=8192 | llama.cpp @ T=8192 |
+|------------------------------------|------------:|-------------------:|
+| Anonymous (compute + repack copy)  | **7064 MiB**|       ~140 MiB     |
+| File-backed (mmap'd weights)       |    782 MiB  |       ~760 MiB     |
+| total RSS                          |   7848 MiB  |       1220 MiB     |
+
+After L1 strips the 720 MiB repack copy, **6344 MiB of activation/
+compute buffer remains**. llama.cpp's whole compute buffer at the same
+workload (from the trajectory poll: post-load 1037 → peak 1220 MiB)
+is **183 MiB**. That's a **35 × compute-buffer gap, not the 6.4 × of
+total RSS**.
+
+L2 (better aliasing) is bounded by what the MemorySolver hasn't already
+recovered. The pool is already at ~89 % paper-budget recovery. At
+T=8192 the linear-attn paper budget alone is ~62 GiB f32 (18 layers ×
+~18 `[1, T, 6144]` tensors × 192 MiB each). Even a perfect pool can't
+drop 6 GiB on top of what 89 % efficiency already saved. L2 is probably
+worth at most a few hundred MiB at T=8192.
+
+### What does scale: L3, and only L3
+
+bf16 activations throughout the residual stream would 2 × compress the
+per-token cost. At T=8192 that takes the +6 GiB activation buffer to
+~3 GiB. Still 15 × llama.cpp, because llama.cpp ALSO uses f16, AND
+uses a single-buffer compute pattern that doesn't carry 18 intermediates
+per layer.
+
+So even L1 + L2 + L3 together at T=8192 lands somewhere in the
+3–4 GiB range. **Still 3 × llama.cpp at long context.**
+
+### Honest take
+
+At long context, no Python-level rewrite and no isolated engine patch
+closes the gap to llama.cpp on this hybrid architecture. The gap is
+the *IR shape × activation precision × per-layer materialization
+pattern*, compounded. Each layer of OV's stack — eager-PyTorch IR with
+f32 intermediates, MemorySolver-based packing, primitive-boundary
+scratchpads — is sized for vision workloads where T ≤ 256. At T=8192
+the same architecture compounds against you.
+
+To get to llama.cpp parity at long context you need either:
+- a different runtime (run the LM through llama.cpp; use OV for the
+  vision encoder only), or
+- something equivalent to llama.cpp's handwritten per-architecture loop
+  built inside the OV CPU plugin: first-class single-buffer compute, f16
+  throughout, no per-IR-op intermediate materialization. That's a
+  rewrite of the linear-attn execution path, not a patch.
+
+The earlier "L1 + L2 closes the gap" framing was based on T=770
+numbers, where L1's 720 MiB is half the gap. That ratio doesn't
+generalize. At T=8192 L1's 720 MiB is 11 % of the gap and the rest is
+not addressable by any combination of plumbing-level changes.

@@ -1,0 +1,95 @@
+L1 patch sketch — to apply after the debug build finishes.
+
+Goal: in Graph::Activate(), after CreatePrimitivesAndExecConstants
+completes, walk all Input nodes and call ov::wsh::Extension::hint_evict
+on each Constant. By that point every primitive's prepareWeightsMemory
+has run and the packed copies are live; the original mmap pages are
+safe to evict.
+
+Files touched:
+  src/plugins/intel_cpu/src/nodes/input.h     # add public accessor
+  src/plugins/intel_cpu/src/nodes/input.cpp   # (no change beyond header decl)
+  src/plugins/intel_cpu/src/graph.cpp         # call hint_evict in Activate()
+
+------------------------------------------------------------
+diff --git a/src/plugins/intel_cpu/src/nodes/input.h b/src/plugins/intel_cpu/src/nodes/input.h
+@@
+ class Input : public Node {
+ public:
+@@
++    // Returns the source Constant node this Input wraps. Used by
++    // Graph::Activate() to evict the original mmap'd weight pages after
++    // all primitives have built their packed copies.
++    const std::shared_ptr<ov::op::v0::Constant>& getConstOp() const noexcept { return m_constOp; }
++
+ private:
+     std::shared_ptr<ov::op::v0::Constant> m_constOp;
+     MemoryCPtr memoryPtr;
+     ...
+ };
+
+------------------------------------------------------------
+diff --git a/src/plugins/intel_cpu/src/graph.cpp b/src/plugins/intel_cpu/src/graph.cpp
+@@
+ #include "openvino/core/parallel.hpp"
++#include "openvino/core/weight_sharing_util.hpp"
+ ...
+ void Graph::Activate() {
+     ...
+     Allocate();
+
+     CreatePrimitivesAndExecConstants();
+
++    // L1: after all primitives have built their packed weight copies,
++    // hint the kernel that the original mmap'd Constant pages can be
++    // released. Saves ~720 MiB on Qwen3.5-0.8B INT8 (measured via the
++    // probe_manual_madvise script that simulates this from Python).
++    // Matches what intel_gpu does in plugin/ops/constant.cpp:149 after
++    // uploading constants to device memory.
++    for (auto& graphNode : graphNodes) {
++        if (auto* inputNode = dynamic_cast<node::Input*>(graphNode.get())) {
++            if (const auto& constOp = inputNode->getConstOp()) {
++                ov::wsh::Extension::hint_evict(*constOp);
++            }
++        }
++    }
++
+ #ifndef CPU_DEBUG_CAPS
+     for (auto& graphNode : graphNodes) {
+         graphNode->cleanup();
+     }
+ #endif
+
+     CPU_DEBUG_CAP_ENABLE(serialize(*this));
+ }
+------------------------------------------------------------
+
+Why this site and not Input::cloneBlobIfRequired:
+- cloneBlobIfRequired runs at graph-Init time, BEFORE prepareWeightsMemory.
+  Calling hint_evict there forces page-faults during primitive setup,
+  paying compile-time latency to bring pages back.
+- Graph::Activate runs once after all primitives are prepared.
+  hint_evict here is no-cost during compile and immediate-effect
+  for runtime RSS.
+
+Why dynamic_cast and not a virtual method:
+- We don't want to add a hint_evict virtual to Node (most nodes have
+  no source Constant). One-off behaviour for Input nodes only.
+
+Risks (small):
+- Multiple Input nodes can share a Constant if the IR has been
+  optimized with constant-folding+sharing. Calling hint_evict
+  N times on the same Constant is safe (it's a hint, MADV_DONTNEED
+  is idempotent), but redundant.
+- The hint is exactly madvise(MADV_DONTNEED) on Linux. On platforms
+  where MappedMemory::hint_evict is a no-op (Windows, maybe macOS in
+  some configs), the patch is also a no-op. Correctness preserved.
+
+Validation plan once built:
+1. Build OV Debug with patched graph.cpp.
+2. Set LD_LIBRARY_PATH to point at the built libs.
+3. Set PYTHONPATH to point at the built Python bindings.
+4. Re-run probe_raw_breakdown.py --T 770 and compare VmHWM to
+   the 2211 MiB baseline. Expect ~1500 MiB (or whatever the
+   simulated madvise from probe_manual_madvise gave).
+5. Re-run at --T 8192. Expect ~7100 MiB (down from 7848).
