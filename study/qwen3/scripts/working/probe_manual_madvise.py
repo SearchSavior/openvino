@@ -27,6 +27,32 @@ def rss():
     return 0
 
 
+def smaps_rollup():
+    out = {}
+    try:
+        with open("/proc/self/smaps_rollup") as f:
+            for line in f:
+                if ":" not in line: continue
+                k, _, rest = line.partition(":")
+                rest = rest.strip()
+                if rest.endswith(" kB"):
+                    out[k.strip()] = int(rest[:-3]) / 1024.0
+    except FileNotFoundError:
+        pass
+    return out
+
+
+def show_split(label):
+    s = smaps_rollup()
+    print(f"  {label}:")
+    print(f"    Rss            = {s.get('Rss',0):7.1f} MiB")
+    print(f"    Anonymous      = {s.get('Anonymous',0):7.1f} MiB")
+    print(f"    Shared_Clean   = {s.get('Shared_Clean',0):7.1f} MiB  (file-backed)")
+    print(f"    Private_Clean  = {s.get('Private_Clean',0):7.1f} MiB  (file-backed)")
+    print(f"    Private_Dirty  = {s.get('Private_Dirty',0):7.1f} MiB  (anonymous + CoW)")
+    print(f"    Pss_File       = {s.get('Pss_File',0):7.1f} MiB")
+
+
 def find_bin_mappings(name_substr):
     rngs = []
     with open("/proc/self/maps") as f:
@@ -40,6 +66,11 @@ def find_bin_mappings(name_substr):
 
 
 def main():
+    import argparse
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--T", type=int, default=770)
+    args = ap.parse_args()
+    T = args.T
     code = f"""
 import sys; sys.path.insert(0, '{Path(__file__).resolve().parents[2] / "kernels"}')
 import openvino as ov
@@ -50,25 +81,26 @@ ov.serialize(m, '{WORK}/probe_madv.xml', '{WORK}/probe_madv.bin')
 """
     subprocess.run([sys.executable, "-c", code], check=True, capture_output=True, text=True)
 
+    print(f"T = {T}")
     print(f"pre-load:       RSS = {rss():7.1f} MiB")
     core = ov.Core()
     lm = core.read_model(f"{WORK}/probe_madv.xml")
     compiled = core.compile_model(lm, "CPU", {"INFERENCE_NUM_THREADS": 4})
     print(f"after compile:  RSS = {rss():7.1f} MiB")
 
-    # warmup: one prefill at T=770 so weights are repacked + compute buffer materialized
     pid_b = lm.input("position_ids").get_partial_shape()[0].get_length()
     hidden = lm.input("inputs_embeds").get_partial_shape()[2].get_length()
     rng = np.random.default_rng(0)
     feeds = {
-        "inputs_embeds":  ov.Tensor(rng.standard_normal((1, 770, hidden), dtype=np.float32) * 0.01),
-        "attention_mask": ov.Tensor(np.ones((1, 770), dtype=np.int64)),
-        "position_ids":   ov.Tensor(np.tile(np.arange(770, dtype=np.int64).reshape(1,1,770), (pid_b,1,1))),
+        "inputs_embeds":  ov.Tensor(rng.standard_normal((1, T, hidden), dtype=np.float32) * 0.01),
+        "attention_mask": ov.Tensor(np.ones((1, T), dtype=np.int64)),
+        "position_ids":   ov.Tensor(np.tile(np.arange(T, dtype=np.int64).reshape(1,1,T), (pid_b,1,1))),
         "beam_idx":       ov.Tensor(np.zeros((1,), dtype=np.int32)),
     }
     req = compiled.create_infer_request()
     req.infer(feeds)
     print(f"after warmup:   RSS = {rss():7.1f} MiB")
+    show_split("after warmup")
 
     rngs = find_bin_mappings("probe_madv.bin")
     total = sum(s for _, s, _ in rngs)
@@ -86,11 +118,13 @@ ov.serialize(m, '{WORK}/probe_madv.xml', '{WORK}/probe_madv.bin')
         print(f"  madvise DONTNEED applied to all {len(rngs)} ranges OK")
 
     print(f"after madvise:  RSS = {rss():7.1f} MiB")
+    show_split("after madvise")
 
     # Re-run a prefill -- weights get paged in again as needed. Lets us see
     # whether this would actually break correctness for subsequent infer.
     req.infer(feeds)
     print(f"after 2nd infer: RSS = {rss():7.1f} MiB")
+    show_split("after 2nd infer")
 
 
 if __name__ == "__main__":

@@ -820,3 +820,114 @@ without mmap-backed weights, there's nothing for `hint_evict` to
 release. But `ENABLE_MMAP` toggle alone doesn't activate the saving;
 the missing piece is the CPU plugin calling `hint_evict`. That is the
 one-line patch.
+
+---
+
+## 2026-06-01 (8K context): the gap widens with T
+
+Driven by `scripts/working/run_llama_bench.py` (llama-bench wrapper with
+per-PID `/proc/<pid>/status` polling) and a one-off run of
+`scripts/working/probe_raw_breakdown.py --T 8192`.
+
+Same Qwen3.5-0.8B model, same 4 threads, same prompt-vs-decode workload
+(`pp8192 + tg32` for llama-bench; raw `ov.Core()` prefill at T=8192 +
+one decode step for OV).
+
+| metric                          | OV raw    | llama.cpp Q8_0 |
+|---------------------------------|----------:|---------------:|
+| peak RSS @ pp=770               |  2212 MiB |       953 MiB  |
+| peak RSS @ pp=8192              |**7848 MiB**|     **1220 MiB**|
+| per-token slope                 | +0.76 MiB |   +0.036 MiB   |
+| OV ÷ llama.cpp at T=770         |    2.3 ×  |       —        |
+| OV ÷ llama.cpp at T=8192        |  **6.4 ×**|       —        |
+
+**The gap widens with T**, by a factor of ~21 per token. At 8K context
+OV holds ~6.6 GiB more resident memory than llama.cpp for the same work.
+
+llama.cpp trajectory at pp=8192 (from `run_llama_bench.py` poll):
+
+```
+ t (s)   RSS (MiB)
+   0      0   (start)
+   1.8    1037 (post model-load)
+  50.0    1220 (peak hit during prefill)
+  50–104  1220 (flat through decode)
+  106     118  (cleanup)
+```
+
+The compute buffer + KV cache growth from post-load to peak is only
++183 MiB on llama.cpp. OV's compute buffer at the same T (post-compile
+164 MiB → warmup peak 7848 MiB) is **+7684 MiB**. That's ~42 × more
+compute buffer for the same workload.
+
+### What L1 actually buys at 8K (measured, not projected)
+
+Ran `probe_manual_madvise.py --T 8192`:
+
+| stage           | RSS (MiB) | Anonymous | Pss_File |
+|-----------------|----------:|----------:|---------:|
+| after warmup    |     7848  |    7064   |    782   |
+| after madvise   |   **7129**|    7064   |     63   |
+| **L1 delta**    |  **−720** | unchanged |  **−719**|
+
+So L1 *does* save 720 MiB at T=8192 — same absolute number as at T=770.
+That projection was correct.
+
+### What I was overconfident about: L2 closing the rest
+
+Earlier text said L2 (better activation aliasing) could close the
+remaining ~5.9 GiB gap. That was speculation, not measurement. Looking
+at the actual breakdown:
+
+| component                          | OV @ T=8192 | llama.cpp @ T=8192 |
+|------------------------------------|------------:|-------------------:|
+| Anonymous (compute + repack copy)  | **7064 MiB**|       ~140 MiB     |
+| File-backed (mmap'd weights)       |    782 MiB  |       ~760 MiB     |
+| total RSS                          |   7848 MiB  |       1220 MiB     |
+
+After L1 strips the 720 MiB repack copy, **6344 MiB of activation/
+compute buffer remains**. llama.cpp's whole compute buffer at the same
+workload (from the trajectory poll: post-load 1037 → peak 1220 MiB)
+is **183 MiB**. That's a **35 × compute-buffer gap, not the 6.4 × of
+total RSS**.
+
+L2 (better aliasing) is bounded by what the MemorySolver hasn't already
+recovered. The pool is already at ~89 % paper-budget recovery. At
+T=8192 the linear-attn paper budget alone is ~62 GiB f32 (18 layers ×
+~18 `[1, T, 6144]` tensors × 192 MiB each). Even a perfect pool can't
+drop 6 GiB on top of what 89 % efficiency already saved. L2 is probably
+worth at most a few hundred MiB at T=8192.
+
+### What does scale: L3, and only L3
+
+bf16 activations throughout the residual stream would 2 × compress the
+per-token cost. At T=8192 that takes the +6 GiB activation buffer to
+~3 GiB. Still 15 × llama.cpp, because llama.cpp ALSO uses f16, AND
+uses a single-buffer compute pattern that doesn't carry 18 intermediates
+per layer.
+
+So even L1 + L2 + L3 together at T=8192 lands somewhere in the
+3–4 GiB range. **Still 3 × llama.cpp at long context.**
+
+### Honest take
+
+At long context, no Python-level rewrite and no isolated engine patch
+closes the gap to llama.cpp on this hybrid architecture. The gap is
+the *IR shape × activation precision × per-layer materialization
+pattern*, compounded. Each layer of OV's stack — eager-PyTorch IR with
+f32 intermediates, MemorySolver-based packing, primitive-boundary
+scratchpads — is sized for vision workloads where T ≤ 256. At T=8192
+the same architecture compounds against you.
+
+To get to llama.cpp parity at long context you need either:
+- a different runtime (run the LM through llama.cpp; use OV for the
+  vision encoder only), or
+- something equivalent to llama.cpp's handwritten per-architecture loop
+  built inside the OV CPU plugin: first-class single-buffer compute, f16
+  throughout, no per-IR-op intermediate materialization. That's a
+  rewrite of the linear-attn execution path, not a patch.
+
+The earlier "L1 + L2 closes the gap" framing was based on T=770
+numbers, where L1's 720 MiB is half the gap. That ratio doesn't
+generalize. At T=8192 L1's 720 MiB is 11 % of the gap and the rest is
+not addressable by any combination of plumbing-level changes.
