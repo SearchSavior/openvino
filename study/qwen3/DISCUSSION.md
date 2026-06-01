@@ -328,3 +328,92 @@ The interesting open question is not "are our kernels fast" — they are
 it pools around its own primitives", and "can a partial absorption
 (keep more of the fused chain as plugin ops) keep the speed and recover
 the memory".
+
+---
+
+## 2026-06-01 (still later): llama.cpp parity attempt
+
+Goal: get the OV-side resident memory down to llama.cpp's footprint on
+the same workload (Qwen3.5-0.8B int8-equivalent, 770pp + 32tg, 4 threads).
+
+`/usr/bin/time -v llama-bench -m /tmp/qwen35-0.8b-Q8_0.gguf -p 770 -n 32 -t 4 -r 1`
+gives `Maximum resident set size: 976396 KiB` → **953 MiB total RSS**.
+
+For comparison the raw-OV baseline measured earlier is **2248 MiB**.
+Gap = **1295 MiB**, larger than anything fusion can move.
+
+### Knob sweep (raw ov.Core(), baseline LM, prompt_len=770)
+
+`scripts/working/run_probe_raw_lowmem.sh` drives one config per fresh
+process, each with the same RSS sampler. Best results:
+
+| config                       | VmHWM (MiB) | prefill (tok/s) | decode (tok/s) |
+|------------------------------|------------:|----------------:|---------------:|
+| default                      |       2250  |          116.4  |          15.35 |
+| INFERENCE_PRECISION_HINT=bf16|       2060  |           92.9  |          13.41 |
+| bf16 + u8 KV + latency + …   |   **2058**  |          105.9  |          13.49 |
+| (v3 fusion, default knobs)   |       2648  |          114.4  |          15.27 |
+| **llama.cpp Q8_0 reference** |     **953** |              —  |              — |
+
+`INFERENCE_PRECISION_HINT=bf16` is the only knob worth ~190 MiB. KV-cache
+u8, single stream, latency hint, dynamic-quant groups all move VmHWM by
+≤4 MiB. The combo of every memory-leaning knob lands at 2058 MiB —
+still **+1105 MiB over llama.cpp**.
+
+### Why the gap is structural
+
+`scripts/working/probe_raw_breakdown.py` reads `/proc/self/smaps_rollup`
+before and after warmup at T ∈ {32, 128, 512, 770}:
+
+|  T  | VmHWM (MiB) | smaps File-backed | smaps Anonymous |
+|-----|------------:|------------------:|----------------:|
+|  32 |       1670  |             0 MiB |       886 MiB   |
+| 128 |       1746  |             0 MiB |       962 MiB   |
+| 512 |       2033  |             0 MiB |      1248 MiB   |
+| 770 |       2212  |             0 MiB |      1427 MiB   |
+
+Two facts that close the explanation:
+
+1. **`File-backed = 0` everywhere.** OV's `ENABLE_MMAP=True` is on by
+   default and does mmap the IR for *reading*, but compile_model copies
+   the weights into anonymous memory (for weight repack / prepack /
+   format conversion). llama.cpp mmaps the GGUF and keeps it
+   file-backed through inference, so those ~720 MiB of weights sit in
+   the page cache (shared, not counted against RSS).
+2. **The compute buffer scales linearly with T** at ~0.73 MiB/token, on
+   top of a ~1500 MiB fixed cost at T=32. llama.cpp's total RSS at
+   T=770 is 953 MiB — *less than OV's compute buffer alone at T=32*.
+
+Roughly attributing the gap:
+- ~720 MiB: OV's anonymous-copy of weights vs llama.cpp's mmap'd GGUF.
+- ~400 MiB: larger fixed compute buffer (oneDNN scratchpads, runtime
+  graph structures, JIT cache).
+- compute buffer growth with T diverges further at larger prompts.
+
+### Implications for the v1/v2/v3 fusion work
+
+Fusion was a kernel/activation lever. It is not the right tool for this
+gap — at best it touches a single-digit-percent of the compute buffer,
+and v3 in particular shows up as a +400 MiB regression (custom-op
+boundary defeats the pool) on top of an already-+1295 MiB-over-llama.cpp
+baseline.
+
+If the goal is llama.cpp parity, the levers are:
+- Get OV to keep weights file-backed through compile (engine-level work
+  in the CPU plugin's transformation passes — non-trivial).
+- Use a backend with smaller fixed compute buffer (NPU? GPU has its own
+  memory; CPU plugin is the largest).
+- Switch engines for this workload.
+
+The fusion work delivers real **compute** wins (v1/v2/v3 all faster
+than stock on prefill and decode at the raw layer) and a +400 MiB
+**memory** regression. It is not in the path of llama.cpp parity.
+
+### Open question
+
+Whether OV exposes a per-`compile_model` flag that prevents weight
+repack (forcing native-int8 kernels at some perf cost) hasn't been
+found. The `SUPPORTED_PROPERTIES` enumeration on CPU includes
+`CPU_SPARSE_WEIGHTS_DECOMPRESSION_RATE`, `ENABLE_WEIGHTLESS`,
+`WEIGHTS_PATH` — none obviously match. If such a flag does not exist,
+closing the gap requires patching the CPU plugin.
