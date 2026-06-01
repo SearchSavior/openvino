@@ -188,3 +188,77 @@ problem, not a kernel-quality problem. A two-line fix in the rewrite
 pack two outputs into one Assign) reclaimed +21 %, +31 %, +21 % of
 decode for v1, v2, v3. Future fusion work should grep for similar
 "packed-output unpack" chains before assuming a perf gap is in C code.
+
+---
+
+## 2026-06-01 (later still): the memory finding the earlier benches missed
+
+The probe was missing a memory column entirely. `probe_pa_path.py` now
+samples `/proc/self/status` (VmRSS via a background thread, VmHWM at
+end) around `VLMPipeline.generate()`. The rewrite + serialize step is
+forked into a subprocess so it does not leave its own peak RSS in the
+parent process.
+
+VmHWM (resident high-water mark) at 770 input tokens, 32-token greedy:
+
+| version  | backend | VmHWM (MiB) |
+|----------|---------|------------:|
+| baseline | PA      |   **2967**  |
+| baseline | SDPA    |     3229    |
+| v1       | PA      |     3473    |
+| v1       | SDPA    |     3670    |
+| v2       | PA      |     3652    |
+| v2       | SDPA    |     3853    |
+| v3       | PA      |     3408    |
+| v3       | SDPA    |     3608    |
+
+### Same-backend comparison (SDPA on both sides) — vs baseline_sdpa
+
+| version | VmHWM Δ |
+|---------|--------:|
+| v1      | +441 MiB |
+| v2      | +624 MiB |
+| v3      | +379 MiB |
+
+**This contradicts the paper-budget headline of `latest_memory.md`.**
+Under apples-to-apples backend, every custom-op config uses *more*
+resident memory than stock. The earlier "v3 saves 296 MiB activation
+vs v1, beats llama.cpp's 491 MiB compute buffer" framing compared a
+`get_runtime_model()` shape-by-dtype walk to llama.cpp's resident
+compute buffer. Different axes. The actual resident-set winner is
+**baseline_pa at 2967 MiB**.
+
+Among the custom configs v3 is the smallest (−62 MiB vs v1, −245 MiB
+vs v2), so the v1→v3 progression *does* monotonically improve our
+own footprint. But that progression never crossed under stock's curve.
+
+### Where the regression likely lives
+
+- The `.so` itself, its libgomp/jit globals, and the ctypes plumbing.
+- Per-call heap scratch in `gdr_kernel_v3` (~3 MiB × 18 layers ≈ 54 MiB,
+  not enough on its own).
+- OpenVINO's MemMgr can pool tensors aggressively around its own
+  primitives but treats the boundary of a custom op as opaque — the
+  state and output tensors of our op cannot share storage with
+  surrounding compute the way plugin nodes do. That is the most
+  plausible source of the rest.
+
+### PA path is also more memory-efficient
+
+- baseline: PA 2967 vs SDPA 3229 → **−262 MiB**
+- v3:       PA 3408 vs SDPA 3608 → **−200 MiB**
+
+So getting the custom op past `paged_attention_transformations` would
+buy both the prefill throughput AND a ~200 MiB resident win.
+
+### Lessons (compounding)
+
+1. **Measure RSS, not paper budget.** A `get_runtime_model()` shape
+   sum is what the plugin would allocate if it couldn't share. It can.
+   The two numbers can move in opposite directions.
+2. **Always fork the prep.** Any model-rewrite step that allocates
+   inside the measurement process inflates the baseline; subprocess
+   isolation gives a number you can trust.
+3. The earlier `latest_memory.md` 391-vs-491-MiB claim should be
+   retracted; the actual peak resident memory comparison is the one
+   above and stock wins on its own backend.
