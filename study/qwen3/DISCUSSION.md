@@ -417,3 +417,54 @@ found. The `SUPPORTED_PROPERTIES` enumeration on CPU includes
 `CPU_SPARSE_WEIGHTS_DECOMPRESSION_RATE`, `ENABLE_WEIGHTLESS`,
 `WEIGHTS_PATH` — none obviously match. If such a flag does not exist,
 closing the gap requires patching the CPU plugin.
+
+### Where the 0.73 MiB/token actually comes from
+
+A flag of `0.73 MiB/token` is too high for this architecture
+(6 self-attn + 18 linear-attn layers, hidden=1024, GQA). Architecturally
+the KV cache should grow at ~0.025 MiB/token (6 self-attn layers ×
+2 × kv_heads × head_dim × 4 bytes), and the 18 linear-attn layers
+should be O(1) per token (recurrent state has no T axis).
+
+`scripts/working/find_per_token_growth.py` walks `get_runtime_model()`
+at T=32 and T=770 and reports per-node Δbytes/token, bucketed:
+
+| bucket      | Σ paper Δ/token | T=770 paper | T=32 paper |
+|-------------|----------------:|------------:|-----------:|
+| linear_attn |        4.64 MiB |     3580 MiB|    152 MiB |
+| other       |        0.92 MiB |      711 MiB|     32 MiB |
+| self_attn   |        0.52 MiB |      397 MiB|     17 MiB |
+| mlp         |        0.33 MiB |      253 MiB|     11 MiB |
+| total paper |    **6.41 MiB** |   **4942**  |   **212**  |
+
+Versus actual measured RSS Δ/token: **0.73 MiB**. So the plugin's pool
+recovers ~89 % of the paper budget. The remaining 0.73 is dominated by
+the linear_attn bucket.
+
+Per linear-attn layer the IR contains ~18 separate `[1, T, 6144]` f32
+buffers — every Transpose / Multiply / Reshape / Split / L2-norm
+output in PyTorch's eager-style decomposition is a distinct IR tensor.
+24 KiB/token × 18 nodes × 18 layers = ~7.6 MiB/token paper, close to
+the measured 4.64 (some nodes alias / share). After the pool: 0.73.
+
+**The architecture does not demand 0.73 MiB/token; the IR representation
+does.** The lever is to fuse more of the per-layer ops into a single
+primitive so the IR-level intermediate set collapses. But our v3
+fusion's custom-op boundary defeats the plugin's pool on its own
+outputs (worth +400 MiB at T=770), and that lost-pool cost is larger
+than the absorbed paper budget reclaim. Net: v3 RSS is worse than
+baseline.
+
+### What it would take to actually shrink resident memory
+
+- Fuse the entire linear-attn module into one custom op (eliminate the
+  18 × `[1, T, 6144]` intermediates from the IR), AND
+- Get the plugin's MemMgr to pool through that op's I/O the way it
+  pools through its own primitives. This is engine-level work in the
+  CPU plugin's memory allocator — declaring our op's outputs as
+  in-place-reusable, or marking input/output tensor descriptors as
+  alias-eligible.
+
+Without (2), absorbing more into the kernel makes resident memory
+*worse* by trading 89 %-poolable IR tensors for 0 %-poolable custom-op
+boundary tensors.
