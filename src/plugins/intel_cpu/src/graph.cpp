@@ -1685,27 +1685,25 @@ void Graph::Infer(SyncInferRequest* request) {
 
     // L1: after the first inference, the original mmap'd weight pages have
     // been read (during prepareWeightsMemory) and the packed copies are
-    // resident. Hint the kernel that the originals can be evicted.
+    // resident. Call hint_evict on every Constant — proper API path.
     // One-shot per Graph instance.
     if (!m_l1_evict_done.exchange(true)) {
-        std::ifstream maps_file("/proc/self/maps");
-        std::string line;
-        size_t total_evicted = 0, ranges = 0;
-        const long page_size = sysconf(_SC_PAGESIZE);
-        while (std::getline(maps_file, line)) {
-            if (line.find(" r--s ") == std::string::npos) continue;
-            if (line.size() < 8 || line.compare(line.size() - 4, 4, ".bin") != 0) continue;
-            unsigned long lo = 0, hi = 0;
-            if (std::sscanf(line.c_str(), "%lx-%lx", &lo, &hi) != 2) continue;
-            size_t len = hi - lo;
-            if (len < static_cast<size_t>(page_size)) continue;
-            if (::madvise(reinterpret_cast<void*>(lo), len, MADV_DONTNEED) == 0) {
-                total_evicted += len;
-                ranges++;
+        size_t total_inputs = 0, with_const = 0, with_src = 0;
+        for (auto& graphNode : graphNodes) {
+            if (auto* inputNode = dynamic_cast<node::Input*>(graphNode.get())) {
+                total_inputs++;
+                if (const auto& constOp = inputNode->getConstOp()) {
+                    with_const++;
+                    if (auto src = ov::wsh::Extension::get_constant_source_buffer(*constOp)) {
+                        with_src++;
+                    }
+                    ov::wsh::Extension::hint_evict(*constOp);
+                }
             }
         }
-        std::cerr << "[L1 evict post-infer] ranges=" << ranges
-                  << " bytes_MiB=" << (total_evicted >> 20) << std::endl;
+        std::cerr << "[L1 evict post-infer via API] inputs=" << total_inputs
+                  << " with_const=" << with_const
+                  << " with_src_buf=" << with_src << std::endl;
     }
 }
 
