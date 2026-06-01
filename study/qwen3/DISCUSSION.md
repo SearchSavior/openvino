@@ -468,3 +468,67 @@ baseline.
 Without (2), absorbing more into the kernel makes resident memory
 *worse* by trading 89 %-poolable IR tensors for 0 %-poolable custom-op
 boundary tensors.
+
+---
+
+## 2026-06-01 (even later): can plugin-native IR rewrites shrink memory?
+
+Goal: reduce per-token IR-shape overhead without going through a custom
+op, so the plugin keeps full ownership of its pool. Implemented three
+rewrites in `kernels/reduce_ir.py`:
+
+1. **`reshape_before_split`** — replaces
+   `VariadicSplit(axis=-1) → 3 × Reshape` with
+   `Reshape → VariadicSplit(axis=-2)`. Intended to eliminate three
+   `[?, T, 2048]` intermediates per layer.
+2. **`fold_q_scale_into_rsqrt`** — folds the Q-path
+   `Multiply(rsqrt) → Transpose → Divide(by sqrt(D))` into
+   `Multiply(rsqrt × 1/sqrt(D)) → Transpose`. Intended to drop a
+   `[?, 16, T, 128]` Divide-output buffer per layer.
+3. **`fuse_l2_norm`** — collapses the 6-op L2-norm chain
+   `(Multiply x×x → ReduceSum → Add(ε) → Sqrt → Divide(1, _) → Multiply)`
+   into a single `NormalizeL2(x, axes, ε, ADD)`.
+
+Probe results (`probe_reduce_ir.py`, raw `ov.Core()`, 770pp+32tg, threads=4):
+
+| mode                              | VmHWM (MiB) | prefill (tok/s) | decode (tok/s) |
+|-----------------------------------|------------:|----------------:|---------------:|
+| baseline                          |     2248.3  |          108.2  |          14.48 |
+| presplit_only                     |     2250.7  |          102.1  |          15.33 |
+| qscale_only                       |     2406.0  |           89.2  |          15.27 |
+| l2norm_only                       |     2250.5  |          117.8  |          13.73 |
+| **safe_combo** (presplit+l2norm)  | **2250.8**  | **132.8** (+22.7 %) | 14.55 |
+| reduced (all three)               |     2404.6  |          102.7  |          16.39 |
+
+### Findings
+
+1. **None of the plugin-native rewrites shrink resident memory.** The
+   floor sits at ~2250 MiB regardless. `presplit` is neutral (the
+   plugin already aliases the original `VariadicSplit` on the last
+   contiguous axis; rewriting to split on `axis=-2` after a 4D reshape
+   forces a non-aliasable split that exactly cancels the eliminated
+   `[?, T, 2048]` buffers). `l2norm` is neutral (NormalizeL2 uses
+   comparable scratch to the manual chain).
+2. **`qscale_only` makes memory worse by +158 MiB.** Removing the
+   `Divide` step almost certainly defeats a postop fusion the plugin
+   was applying to the upstream Multiply / Transpose, costing more in
+   scratch than the eliminated tensor saved.
+3. **`presplit + l2norm` (the safe combo) is +23 % prefill at neutral
+   memory.** Real prefill win, zero memory move. Decode is flat.
+
+### Verdict
+
+Reducing IR tensor count from Python is not the path to memory
+reduction. The plugin already pools the per-layer
+`[1, T, 6144]` / `[1, T, 2048]` intermediates at ~89 % efficiency; the
+remaining 11 % is what we'd hope to eliminate, but the rewrites either
+move it (no net change) or break neighbouring fusions (net negative).
+
+For memory, the lever has to be inside the CPU plugin (keep weights
+file-backed through compile, or shrink the fixed compute buffer).
+The fusion work and the IR rewrites are both prefill wins, not memory
+wins.
+
+For prefill speed, the safe combo at +22.7 % is the best result in this
+work that does not regress anything else, and it stays fully inside the
+supported OpenVINO API.
