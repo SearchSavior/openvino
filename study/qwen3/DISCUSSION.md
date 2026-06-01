@@ -262,3 +262,69 @@ buy both the prefill throughput AND a ~200 MiB resident win.
 3. The earlier `latest_memory.md` 391-vs-491-MiB claim should be
    retracted; the actual peak resident memory comparison is the one
    above and stock wins on its own backend.
+
+---
+
+## 2026-06-01 (still later): raw ov.Core() probe — is the regression genai?
+
+`scripts/working/probe_raw.py` + `run_probe_raw.sh` repeat the
+770-token one-shot prefill + 32-token decode at the raw `ov.Core()`
+layer, no `ov_genai.VLMPipeline` involved. Subprocess prep for v1/v2/v3,
+same RSS sampler, same THREADS=4.
+
+| version  | prefill (tok/s) | decode (tok/s) | VmHWM (MiB) |
+|----------|----------------:|---------------:|------------:|
+| baseline |          113.6  |         14.01  |  **2248**   |
+| v1       |          189.6  |         15.19  |    2706     |
+| v2       |          186.6  |         15.72  |    2885     |
+| v3       |          114.4  |         15.27  |    2648     |
+
+### Compute (raw layer, same backend on both sides)
+
+| version | prefill Δ vs baseline | decode Δ vs baseline |
+|---------|----------------------:|---------------------:|
+| v1      | **+67 %**             | **+8.4 %**           |
+| v2      | **+64 %**             | **+12.2 %**          |
+| v3      | +0.7 %                | **+9.0 %**           |
+
+All three fusions are now strictly faster than stock at both prefill and
+decode at the raw layer. v3 trades almost all prefill back for the
+absorbed conv1d but holds the decode win.
+
+### Memory (raw layer)
+
+| version | VmHWM Δ vs baseline |
+|---------|--------------------:|
+| v1      |             +458 MiB |
+| v2      |             +637 MiB |
+| v3      |             +400 MiB |
+
+Compared to the genai-SDPA matrix (+441 / +624 / +379), the raw and
+genai deltas are within ±20 MiB of each other. **The memory regression
+is structural to the custom-op boundary, not a genai-pipeline artifact.**
+
+### Genai's own overhead, as a side product
+
+| metric          | raw baseline | genai baseline_pa | genai baseline_sdpa |
+|-----------------|-------------:|------------------:|--------------------:|
+| VmHWM           |    2248 MiB  |          2967 MiB |            3229 MiB |
+| genai overhead  |       —      |         **+719**  |          **+981**   |
+
+A genai user pays ~720 MiB just for the VLM machinery on top of the LM
+(tokenizer + detokenizer + vision encoder + merger + embed + sampler +
+PA block manager). The custom-op fusion adds another ~400 MiB on top.
+
+### Honest end-to-end summary
+
+- **Compute (kernels):** v1/v2/v3 are faster than stock at the raw
+  layer on both prefill and decode. v2 wins.
+- **Memory (resident):** v1/v2/v3 are +400–637 MiB worse than stock at
+  both raw and pipeline layers. v3 is the smallest of the customs.
+- **Pipeline overhead:** ~+720–980 MiB for genai's VLM stack on top of
+  whatever the LM weighs, independent of fusion choice.
+
+The interesting open question is not "are our kernels fast" — they are
+— but "why can't the plugin pool storage around our custom op the way
+it pools around its own primitives", and "can a partial absorption
+(keep more of the fused chain as plugin ops) keep the speed and recover
+the memory".
