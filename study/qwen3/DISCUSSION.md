@@ -532,3 +532,162 @@ wins.
 For prefill speed, the safe combo at +22.7 % is the best result in this
 work that does not regress anything else, and it stays fully inside the
 supported OpenVINO API.
+
+---
+
+## 2026-06-01 (final): scope of the C++ patches required for llama.cpp parity
+
+I traced the OV CPU plugin source to identify where the gap-causing
+allocations actually happen. Three levels, ordered by how local /
+contained each patch is.
+
+### Level 1: avoid weight repack into anonymous memory  ~720 MiB
+
+**Single function. Days of work. Real perf risk.**
+
+The flow today, two allocations per weight tensor:
+
+1. `Input::cloneBlobIfRequired()`
+   — `src/plugins/intel_cpu/src/nodes/input.cpp:420`
+   For int8 weights with no subnormals on a single-NUMA host, the
+   `clone_is_not_needed` branch (line 575) IS taken. That branch already
+   wraps the original Constant pointer directly without copying:
+   ```cpp
+   memoryPtr = std::make_shared<Memory>(getEngine(), memDesc, m_constOp->get_data_ptr());
+   ```
+   So on the IR-read side, no anonymous copy is forced.
+
+2. `prepareWeightsMemory(...)`
+   — `src/plugins/intel_cpu/src/nodes/executors/dnnl/dnnl_utils.cpp:30`
+   Called from `DnnlFCPrimitive::create()` at
+   `src/plugins/intel_cpu/src/nodes/executors/dnnl/dnnl_fullyconnected_primitive.cpp:464`.
+   It:
+   ```cpp
+   MemoryPtr _ptr = std::make_shared<Memory>(eng, dstWeightDesc);  // NEW anon alloc
+   node::Reorder::reorderData(srcMemory, *_ptr, rtCache, threadPool);
+   ```
+   This is where the second 720 MiB-class anonymous copy is born — the
+   packed/blocked layout DNNL's brgemm primitive wants. After this,
+   both the mmap'd original and the packed copy are live.
+
+   `ov.serialize` should produce a `.bin` that the next `read_model`
+   mmaps (`ENABLE_MMAP=True` is the default). Our smaps showed
+   `File=0`, so either the IR frontend is not actually keeping the
+   weight mmap file-backed past compile, or the `prepareWeightsMemory`
+   reorder is freeing the mmap reference before the packed copy lands.
+   The exact path warrants one more trace — but the eliminable bytes
+   are the **packed** copy regardless.
+
+   The patch ideas:
+   - **Force native-format weights** for brgemm-decompressed paths so
+     no repack is needed. The brgemm AMX/AVX-512 INT8 impls *can* take
+     plain row-major in some cases at a perf cost; need to check
+     `dnnl_fullyconnected_primitive.cpp:460-470` for whether
+     `weights_desc()` is queried from the primitive (DNNL chose the
+     packed layout) or specified by us. If it's the former, hard.
+   - **Reorder in-place** into the original mmap pages — requires the
+     mmap to be writable. `MAP_PRIVATE` would give us CoW pages which
+     end up anonymous anyway, defeating the point.
+   - **Stream-reorder** so the packed buffer is built one block at a
+     time and the original mmap pages can be freed/madvise-don't-need
+     incrementally. Cuts peak by ~700 MiB at compile time, no runtime
+     cost.
+
+   **Scope of edit**: One function in one file (`prepareWeightsMemory`),
+   plus possibly a flag plumbed through `DnnlFCPrimitive::create`. Best
+   case: 50–150 lines.
+   **Risk**: oneDNN's int8 brgemm impls in OV's vendored dnnl don't
+   uniformly support native-format weight. May force a slower fallback,
+   cutting prefill from 116 tok/s back toward 50–60 tok/s. Each impl
+   path would need a check + benchmark.
+
+### Level 2: shrink the activation block the MemorySolver hands out  ~300–500 MiB
+
+**Refactor of `MemoryControl` + a new transformation pass. Weeks.**
+
+The pool already recovers 89 % of the paper budget
+(4.6 → 0.5 MiB/token on linear_attn). The remaining 11 % is the cost
+of the per-layer eager-IR shape: every Transpose/Multiply/Reshape/Split
+in the PyTorch export is its own live tensor over a non-trivial
+interval, so the MemorySolver can't pack them tighter.
+
+Plugin-native rewrites (`scripts/working/probe_reduce_ir.py`) tried to
+cut tensor count from Python. Net effect: zero or negative on RSS
+because the original `VariadicSplit(axis=-1)` is already alias-able
+on the contiguous axis, and folding things like `Divide(by sqrt(D))`
+defeats existing postop fusions.
+
+Real options inside the plugin:
+
+- **Implement an in-place-pass that marks producer/consumer pairs as
+  alias-eligible at the `Edge` level.** Files involved:
+  `graph.cpp:761-895` (the allocation-cluster loop) and
+  `edge.cpp` (Edge alias plumbing). The challenge is making this
+  work for ops with non-trivial layout reorders between producer
+  and consumer.
+- **Add a transformation that converts the eager-style linear-attn
+  module into a smaller graph of broader primitives** (e.g. a
+  hypothetical `LinearAttentionPrep` op that consumes
+  `[B, T, hidden]` and emits `[B, H, T, D]` Q/K/V without intermediate
+  IR edges). This is closer to what we did with `GatedDeltaRule` but
+  *inside* the CPU plugin so MemMgr keeps ownership.
+
+  Files: a new pass under
+  `src/plugins/intel_cpu/src/transformations/cpu_opset/common/op/` and
+  a new node implementation under
+  `src/plugins/intel_cpu/src/nodes/`. ~500–1000 lines plus tests.
+
+### Level 3: cut activation precision from f32 to bf16/f16 through the layer  ~500 MiB
+
+**Engine-level rework. Months.**
+
+Even with `INFERENCE_PRECISION_HINT=bf16` set we only saw a 190 MiB
+drop. That's because the hint controls MatMul compute precision and a
+few jit kernels, not the full residual stream / RMSNorm / Mul / Add
+chain. The post-LN hidden state buffers stay f32, and so do many of
+the activation Reorders the plugin inserts between primitives.
+
+llama.cpp is f16 throughout the hidden state by default, which gives
+2× compression on the per-T activation buffers. Matching this in OV
+would mean:
+
+- Making all the `Multiply`, `Add`, `RMSNorm`, `Swish`, `Reshape`,
+  `Transpose`, `Concat`, `Slice` nodes in the residual-stream chain
+  produce bf16, not f32.
+- Auditing each oneDNN primitive's bf16-input/f32-output paths.
+- Handling the inevitable bf16-overflow checks (line 461-491 of
+  `input.cpp` already does this for weights; would need similar at
+  activation level).
+
+This is the path most of the runtime memory gap actually lives in.
+It's also the deepest. Probably not contained to a few files; you
+end up touching every common node's `prepareParams`.
+
+### Practical answer to "how low are these changes"
+
+| Level | Savings target | Files touched | LoC | Time | Perf risk |
+|-------|---------------:|---------------|-----|------|-----------|
+| L1: skip weight repack       | ~720 MiB | `dnnl_utils.cpp`, `dnnl_fullyconnected_primitive.cpp` | 50–150 | days | medium–high (slower brgemm fallback) |
+| L2: better activation aliasing | ~300–500 MiB | `memory_control.cpp`, `graph.cpp`, `edge.cpp`, new transformation pass | 500–1000 | weeks | low |
+| L3: bf16 residual stream     | ~500 MiB | many: every common node executor, validation passes | thousands | months | model-accuracy risk |
+
+L1 alone closes the gap to **~1500 MiB**. L1 + L2 → **~1100 MiB**.
+L1 + L2 + L3 → **~600 MiB**, below llama.cpp's 953 MiB.
+
+None of these are "low" by our `study/qwen3/scripts/working/` rewrite
+standards. They are all CPU-plugin commits, with the corresponding
+review burden.
+
+### Recommended next step
+
+If memory parity is the goal: spend two days on L1 with a benchmark
+guard rail (any prefill regression > 15 % blocks the patch). If the
+brgemm AMX impl accepts native-format int8 weights at acceptable
+speed, that's the entire 720 MiB win. If not, none of the higher
+levels are worth starting without a fundamentally different attack
+plan (different backend, weights-on-NPU, etc.).
+
+For everything else — speed, correctness, kernel design — the work in
+this branch already lands real wins (custom ops are faster than stock
+at the raw layer; `safe_combo` is +22.7 % prefill at neutral memory)
+and is portable across OpenVINO versions.
