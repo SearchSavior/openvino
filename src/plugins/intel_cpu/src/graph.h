@@ -4,6 +4,7 @@
 
 #pragma once
 
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
@@ -303,6 +304,9 @@ protected:
     // For dumping purposes. -1 - no counting, all other positive
     // values mean increment it within each Infer() call
     int infer_count = -1;
+
+    // L1: one-shot post-first-infer madvise on mmap'd weight pages.
+    std::atomic<bool> m_l1_evict_done{false};
 
     std::vector<NodePtr> graphNodes;
     std::vector<EdgePtr> graphEdges;

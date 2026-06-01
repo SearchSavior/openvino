@@ -100,10 +100,12 @@ std::shared_ptr<ov::AlignedBuffer> Extension::get_constant_source_buffer(const o
 }
 
 void Extension::hint_evict(ov::op::v0::Constant& constant) noexcept {
+    // Note: the get_descriptor() gate was filtering out SharedBuffer<MappedMemory>
+    // buffers, which are created without a descriptor by the IR frontend
+    // (frontend.cpp line ~221) when ENABLE_MMAP=True. Those buffers DO support
+    // hint_evict via their templated specialization. Call unconditionally.
     if (constant.m_data) {
-        if (constant.m_data->get_descriptor()) {
-            constant.m_data->hint_evict();
-        }
+        constant.m_data->hint_evict();
     }
 }
 

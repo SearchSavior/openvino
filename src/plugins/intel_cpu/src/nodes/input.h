@@ -86,6 +86,14 @@ public:
     bool needShapeInfer() const override {
         return false;
     }
+
+    // Returns the source Constant node this Input wraps, if any. Used by
+    // Graph::Activate() to evict the original mmap'd weight pages after
+    // all primitives have built their packed copies (L1 / hint_evict).
+    const std::shared_ptr<ov::op::v0::Constant>& getConstOp() const noexcept {
+        return m_constOp;
+    }
+
     bool needPrepareParams() const override {
         return false;
     }

@@ -61,6 +61,11 @@
 #include "openvino/core/partial_shape.hpp"
 #include "openvino/core/type.hpp"
 #include "openvino/core/type/element_type.hpp"
+#include "openvino/core/weight_sharing_util.hpp"
+#include <sys/mman.h>
+#include <unistd.h>
+#include <fstream>
+#include <iostream>
 #include "openvino/itt.hpp"
 #include "openvino/op/assign.hpp"
 #include "openvino/op/parameter.hpp"
@@ -1676,6 +1681,31 @@ void Graph::Infer(SyncInferRequest* request) {
 
     if (infer_count != -1) {
         infer_count++;
+    }
+
+    // L1: after the first inference, the original mmap'd weight pages have
+    // been read (during prepareWeightsMemory) and the packed copies are
+    // resident. Hint the kernel that the originals can be evicted.
+    // One-shot per Graph instance.
+    if (!m_l1_evict_done.exchange(true)) {
+        std::ifstream maps_file("/proc/self/maps");
+        std::string line;
+        size_t total_evicted = 0, ranges = 0;
+        const long page_size = sysconf(_SC_PAGESIZE);
+        while (std::getline(maps_file, line)) {
+            if (line.find(" r--s ") == std::string::npos) continue;
+            if (line.size() < 8 || line.compare(line.size() - 4, 4, ".bin") != 0) continue;
+            unsigned long lo = 0, hi = 0;
+            if (std::sscanf(line.c_str(), "%lx-%lx", &lo, &hi) != 2) continue;
+            size_t len = hi - lo;
+            if (len < static_cast<size_t>(page_size)) continue;
+            if (::madvise(reinterpret_cast<void*>(lo), len, MADV_DONTNEED) == 0) {
+                total_evicted += len;
+                ranges++;
+            }
+        }
+        std::cerr << "[L1 evict post-infer] ranges=" << ranges
+                  << " bytes_MiB=" << (total_evicted >> 20) << std::endl;
     }
 }
 
