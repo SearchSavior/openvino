@@ -176,6 +176,10 @@ private:
     bool runAsDynamic() const;
     void restoreSubgraphInputByBackEdges();
 
+    /* re-resolve cached input_mems/output_mem from the subgraph; called
+     * from prepareParams to recover after CompiledModel::release_memory() */
+    void refreshSubgraphMemories();
+
     Graph sub_graph;
     std::vector<std::vector<MemoryPtr>> input_mems;
     std::vector<MemoryPtr> output_mem;

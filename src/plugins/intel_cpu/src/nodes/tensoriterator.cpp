@@ -642,9 +642,38 @@ bool TensorIterator::needPrepareParams() const {
     // trip count
     return Node::needPrepareParams();
 }
+void TensorIterator::refreshSubgraphMemories() {
+    // The cached pointers in input_mems / output_mem were captured at
+    // createPrimitive() time. If the parent CompiledModel had release_memory()
+    // called on it (which frees the underlying MemoryBlocks via
+    // NetworkMemoryControl::releaseMemory()) the cached shared_ptrs point at
+    // Memory objects whose data() is now null. The subgraph's allocateMemory
+    // will re-grow the blocks on next infer, but our cached pointers may not
+    // point at the same Memory objects anymore — re-resolve them from the
+    // subgraph.
+    auto subgraphOp = ov::as_type_ptr<const ov::op::util::SubGraphOp>(ngraphOp);
+    if (!subgraphOp) return;
+
+    input_mems.clear();
+    for (const auto& param : subgraphOp->get_function()->get_parameters()) {
+        if (auto inNode = sub_graph.getInputNodeByIndex(
+                subgraphOp->get_function()->get_parameter_index(param))) {
+            input_mems.push_back(getToMemories(inNode.get(), 0));
+        }
+    }
+    output_mem.clear();
+    for (const auto& out : subgraphOp->get_function()->get_results()) {
+        if (auto outNode = sub_graph.getOutputNodeByIndex(
+                subgraphOp->get_function()->get_result_index(out))) {
+            output_mem.push_back(outNode->getSrcMemoryAtPort(0));
+        }
+    }
+}
+
 void TensorIterator::prepareParams() {
     // due to specific createPrimitive implementation this method is called only during inference
     constexpr bool compileStage = false;
+    refreshSubgraphMemories();
     prepareParamsImpl(compileStage);
 }
 
