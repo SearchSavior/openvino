@@ -427,6 +427,13 @@ void CompiledModel::release_memory() {
         auto ctx = graph.getGraphContext();
         ctx->releaseMemory();
     }
+
+    // Deep release: also clear the per-socket weights cache. Without this,
+    // packed weight copies stay resident across requests even though
+    // graph contexts have been released. These can be ~hundreds of MiB to
+    // GiB and dominate the post-release floor for LLM workloads.
+    // Weights will be rebuilt lazily on next infer via prepareWeightsMemory.
+    m_socketWeights.clear();
 }
 
 }  // namespace ov::intel_cpu

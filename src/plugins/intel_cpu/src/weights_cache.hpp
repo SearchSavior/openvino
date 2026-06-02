@@ -73,6 +73,13 @@ public:
 
     SharedMemory::Ptr get(const std::string& key) const;
 
+    /** @brief Clear all cached weight references so underlying Memory objects
+     * can be destroyed. Used by deep release_memory paths. */
+    void clear() {
+        std::unique_lock<std::mutex> lock(guard);
+        sharedWeights.clear();
+    }
+
 #ifdef CPU_DEBUG_CAPS
     Statistics dumpStatistics() const;
 #endif  // CPU_DEBUG_CAPS
@@ -93,6 +100,13 @@ public:
 
     WeightsSharing::Ptr& operator[](int socket_id);
     const WeightsSharing::Ptr& operator[](int socket_id) const;
+
+    /** @brief Clear all WeightsSharing instances across all sockets. */
+    void clear() {
+        for (auto& [id, ws] : _cache_map) {
+            if (ws) ws->clear();
+        }
+    }
 
 #ifdef CPU_DEBUG_CAPS
     [[nodiscard]] std::vector<std::pair<int, WeightsSharing::Statistics>> dumpStatistics() const;
