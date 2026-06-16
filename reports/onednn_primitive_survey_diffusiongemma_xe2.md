@@ -49,7 +49,7 @@ primitives.
 | RoPE | none | **AUTHOR SYCL** | — |
 | Attention (SDPA) | internal `sdpa` micro-kernel | **REUSE w/ gaps** | `src/gpu/intel/sdpa/micro.*` |
 | ↳ `full_attention` layers (~1 in 6) | causal block-skip (`k0end`) + GQA | **REUSE (efficient)** | `micro.cl:536-545` |
-| ↳ `sliding_attention` layers (majority) | no window lower bound (`k0start`) | **REUSE but inefficient → patch** *(unverified)* | `micro.cl:769`; patch file |
+| ↳ `sliding_attention` layers (majority) | bound KV to `W` in the cache (à la `SlidingWindowSpec`) | **REUSE via cache-level windowing** (kernel patch = contingency) | `kv_cache_interface.py:472` |
 | ↳ mixed causal/bidirectional per-seq mask | `attn_mask` *buffer* (float additive) | **REUSE via mask buffer** | `sdpa_types.hpp:44-55` |
 | ↳ logit soft-capping inside attn | Graph API `optional_soft_capping` | **REUSE via Graph API** | `patterns/sdp.cpp:148`, `utils.hpp:453` |
 | MoE / gated MLP | internal `gated_mlp` (gate+act+mul+down) | **REUSE w/ gaps** | `gated_mlp/ref.hpp:49-59` |
@@ -195,8 +195,9 @@ KV is out-of-window for a local layer.
 4. **Attention is also GEMM-shaped in decode.** Because a step has
    `canvas_length` queries (not 1), the SDPA `ugemm` KQ/VS matmuls are
    DPAS-friendly — unlike AR flash-decoding, which is a batch-1 GEMV. This makes
-   the `sdpa` micro-kernel a strong fit in decode too (and tempers the urgency of
-   the sliding-window `k0start` patch for small canvases, §3.2).
+   the `sdpa` micro-kernel a strong fit in decode too. Sliding-window efficiency
+   is handled by **cache-level windowing** (bound stored KV to `W`), not a kernel
+   patch (§3.2) — so the kernel sees only `CL` queries × `min(context, W)` keys.
 
 5. **More raw FLOPs, but at far higher utilization — *not* unconditionally
    fewer sequential steps.** Diffusion does ~`(S+1)×` the token-passes of AR per
@@ -314,20 +315,28 @@ The three gaps:
    saving** on long contexts. For the `full_attention` layers (~1 in 6, also the
    `k_eq_v` layers) reuse is efficient as-is.
 
-   **Proposed mitigation (UNVERIFIED):** add a symmetric `k0start` lower bound to
-   `micro.cl` mirroring the existing `k0end` logic — a small, localized patch
-   (loop start + the `first` online-softmax flag), *not* a from-scratch kernel.
-   A gist-style diff is in
-   [`patches/onednn_sdpa_sliding_window_k0start.patch`](patches/onednn_sdpa_sliding_window_k0start.patch).
-   **⚠ This is a hypothesis and must be tested before being relied on.** The
-   claim — that the current mask-buffer path pays full lower-range compute and
-   that `k0start` recovers `O(seq·W)` — needs (a) a **correctness** check vs the
-   dense reference and a PyTorch/vLLM SWA reference, and (b) a **perf/necessity**
-   benchmark sweeping sequence length at fixed `W` on the **actual Xe2 dGPU**, to
-   confirm the current kernel really does scale `O(seq²)` here (if it already
-   plateaus, the patch is unnecessary and should be dropped). Short canvases /
-   short contexts likely see no benefit. See the patch file's "VERIFICATION
-   REQUIRED" section.
+   **PREFERRED FIX — windowing belongs in the KV cache, not the kernel.** The
+   right lever is to **bound the stored/presented KV to `W` for sliding layers**,
+   exactly as vLLM does with a per-layer `SlidingWindowSpec` (allocates only
+   `cdiv(sliding_window, block_size) + 1` blocks per sliding layer,
+   `vllm/v1/kv_cache_interface.py:472`,
+   `vllm/v1/simple_kv_offload/manager.py:217-218`). If the OpenVINO/Xe2 backend's
+   paged KV cache replicates this, the block table for a sliding layer points at
+   only ~`W` keys, so the SDPA kernel is *handed* ~`W` keys and its existing
+   `k0end` loop naturally iterates only those — **no kernel change needed** — and,
+   more importantly, **KV memory is bounded to `W`** (the larger prize). This
+   supersedes the kernel patch for the common case.
+
+   **Kernel patch is now a CONTINGENCY (deprioritized).** A symmetric `k0start`
+   lower bound in `micro.cl` (gist diff:
+   [`patches/onednn_sdpa_sliding_window_k0start.patch`](patches/onednn_sdpa_sliding_window_k0start.patch))
+   only matters in a fallback design where sliding layers store *full* KV and
+   rely on an additive mask — which we should avoid anyway for the memory reason.
+   So unless cache-level windowing is infeasible, **don't pursue the patch.** It
+   remains UNVERIFIED and, if ever needed, still requires the correctness + Xe2
+   perf checks in the patch file's "VERIFICATION REQUIRED" section. Note also that
+   canvas tiling already bounds the *query* side to `M = canvas_length` (§1A); the
+   patch was only ever about the *key* side, which cache-level windowing handles.
 
 1. **Mixed causal / bidirectional per request.** SDPA's built-in masks are
    `top_left` / `bottom_right` causal or a **buffer mask**
@@ -421,13 +430,14 @@ RoPE, gather, mask/router builders) in SYCL.**
    sliding-vs-full head dims fit the Xe2 micro-kernel's `d_max`
    (`sdpa/micro.hpp:347`, `configs.cpp`). If not, fall back to
    matmul+softmax+matmul (all reusable) for the oversized layers.
-1b. **Sliding-window compute scaling (the `k0start` hypothesis).** *Highest-
-   priority unverified claim.* Benchmark the current mask-buffer SWA path vs the
-   proposed `k0start` patch on Xe2, sweeping sequence length at fixed window `W`,
-   and validate correctness vs the dense reference. Only adopt the patch if the
-   current kernel demonstrably scales `O(seq²)` for local layers; drop it if it
-   already plateaus. Details + diff:
-   `patches/onednn_sdpa_sliding_window_k0start.patch`.
+1b. **Sliding-window handling = cache-level windowing (preferred), not the
+   kernel patch.** Implement a per-layer sliding-window KV cache in the
+   OpenVINO/Xe2 backend (mirror vLLM's `SlidingWindowSpec`) so sliding layers
+   store/present only ~`W` keys — this bounds both attention compute and KV
+   memory, and the SDPA kernel needs no change. Verify the chosen KV-cache impl
+   actually does this. The `k0start` kernel patch
+   (`patches/onednn_sdpa_sliding_window_k0start.patch`) is now a **contingency**
+   only for a full-KV+mask fallback; deprioritized and still unverified.
 2. **Bidirectional masking cost.** Validate that a float additive mask buffer
    on Xe2 doesn't defeat the micro-kernel's causal-skip optimization for the
    *encoder* rows; if it does, consider a per-seq causal predicate patch.
