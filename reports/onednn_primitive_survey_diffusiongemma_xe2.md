@@ -320,7 +320,7 @@ The three gaps:
    exactly as vLLM does with a per-layer `SlidingWindowSpec` (allocates only
    `cdiv(sliding_window, block_size) + 1` blocks per sliding layer,
    `vllm/v1/kv_cache_interface.py:472`,
-   `vllm/v1/simple_kv_offload/manager.py:217-218`). If the OpenVINO/Xe2 backend's
+   `vllm/v1/simple_kv_offload/manager.py:217-218`). If our oneDNN/SYCL Xe2 backend's
    paged KV cache replicates this, the block table for a sliding layer points at
    only ~`W` keys, so the SDPA kernel is *handed* ~`W` keys and its existing
    `k0end` loop naturally iterates only those — **no kernel change needed** — and,
@@ -411,7 +411,7 @@ vLLM's wins (from the companion report) translate to this oneDNN/Xe2 plan:
 |---|---|
 | Single backbone, encoder/decoder modes | One graph; **phase = the attn-mask buffer** we build, not two models |
 | Mixed causal/bidirectional in one batch | **float additive `attn_mask` buffer** consumed by the `sdpa` micro-kernel (custom builder, reused attention) |
-| Reuse spec-decode data path | Lives in the serving layer (OpenVINO/vLLM), not oneDNN; oneDNN sees fixed `[seqs, canvas, ...]` tensors |
+| Reuse spec-decode data path | Lives in the serving/runtime layer (our backend, à la vLLM), not oneDNN; oneDNN sees fixed `[seqs, canvas, ...]` tensors |
 | One fused `torch.compile` sampler step | **One/few fused SYCL kernels** over pre-allocated state buffers (no oneDNN primitive) |
 | SC stored as `[..,hidden]` | `matmul` (`probs @ embed`) + `gated_mlp`/`matmul`; storage is host buffer policy |
 | Fused fp32 softcap | `eltwise_tanh` matmul **post-op** |
@@ -432,7 +432,7 @@ RoPE, gather, mask/router builders) in SYCL.**
    matmul+softmax+matmul (all reusable) for the oversized layers.
 1b. **Sliding-window handling = cache-level windowing (preferred), not the
    kernel patch.** Implement a per-layer sliding-window KV cache in the
-   OpenVINO/Xe2 backend (mirror vLLM's `SlidingWindowSpec`) so sliding layers
+   oneDNN/SYCL Xe2 backend (mirror vLLM's `SlidingWindowSpec`) so sliding layers
    store/present only ~`W` keys — this bounds both attention compute and KV
    memory, and the SDPA kernel needs no change. Verify the chosen KV-cache impl
    actually does this. The `k0start` kernel patch
