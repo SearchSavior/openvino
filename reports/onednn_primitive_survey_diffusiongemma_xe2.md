@@ -48,6 +48,8 @@ primitives.
 | `k_eq_v` (K reused as V) | weight-layout/packing choice, no V GEMM | **REUSE (host-side wiring)** | — |
 | RoPE | none | **AUTHOR SYCL** | — |
 | Attention (SDPA) | internal `sdpa` micro-kernel | **REUSE w/ gaps** | `src/gpu/intel/sdpa/micro.*` |
+| ↳ `full_attention` layers (~1 in 6) | causal block-skip (`k0end`) + GQA | **REUSE (efficient)** | `micro.cl:536-545` |
+| ↳ `sliding_attention` layers (majority) | no window lower bound (`k0start`) | **REUSE but inefficient → patch** *(unverified)* | `micro.cl:769`; patch file |
 | ↳ mixed causal/bidirectional per-seq mask | `attn_mask` *buffer* (float additive) | **REUSE via mask buffer** | `sdpa_types.hpp:44-55` |
 | ↳ logit soft-capping inside attn | Graph API `optional_soft_capping` | **REUSE via Graph API** | `patterns/sdp.cpp:148`, `utils.hpp:453` |
 | MoE / gated MLP | internal `gated_mlp` (gate+act+mul+down) | **REUSE w/ gaps** | `gated_mlp/ref.hpp:49-59` |
@@ -152,7 +154,38 @@ supports everything the backbone needs:
 - a **`d_max` head-dim limit** (`micro.hpp:347`) — must verify Gemma's
   `global_head_dim` fits the micro-kernel's supported range on Xe2.
 
-The two gaps:
+The three gaps:
+0. **Sliding-window (local) attention efficiency.** Gemma4 is *hybrid*: most
+   layers are `sliding_attention` (local window `W`), interleaved with a few
+   `full_attention` layers (`gemma4.py:435-437, 560-562`; typically a 5:1 ratio).
+   The micro-kernel reads each layer's keys in a tiled loop
+   `for (k0 = 0; k0 < k0end; ...)` (`micro.cl:769`) and already trims the
+   **upper** key bound for causal masks via `k0end`
+   (`micro.cl:536-545`) — FlashAttention-style block skipping. **But there is no
+   *lower* bound**: the loop always starts at key 0, and `sdpa_desc_t` has **no
+   window field** (mask types are only `undef/buffer/top_left/bottom_right`,
+   `sdpa_types.hpp:43-55`). So a sliding window can only be expressed as an
+   additive `attn_mask` buffer, which the kernel computes-then-masks over the
+   full lower range — i.e. `O(seq²/2)` per local layer rather than SWA's
+   `O(seq·W)`. This is **functionally correct reuse but loses SWA's compute
+   saving** on long contexts. For the `full_attention` layers (~1 in 6, also the
+   `k_eq_v` layers) reuse is efficient as-is.
+
+   **Proposed mitigation (UNVERIFIED):** add a symmetric `k0start` lower bound to
+   `micro.cl` mirroring the existing `k0end` logic — a small, localized patch
+   (loop start + the `first` online-softmax flag), *not* a from-scratch kernel.
+   A gist-style diff is in
+   [`patches/onednn_sdpa_sliding_window_k0start.patch`](patches/onednn_sdpa_sliding_window_k0start.patch).
+   **⚠ This is a hypothesis and must be tested before being relied on.** The
+   claim — that the current mask-buffer path pays full lower-range compute and
+   that `k0start` recovers `O(seq·W)` — needs (a) a **correctness** check vs the
+   dense reference and a PyTorch/vLLM SWA reference, and (b) a **perf/necessity**
+   benchmark sweeping sequence length at fixed `W` on the **actual Xe2 dGPU**, to
+   confirm the current kernel really does scale `O(seq²)` here (if it already
+   plateaus, the patch is unnecessary and should be dropped). Short canvases /
+   short contexts likely see no benefit. See the patch file's "VERIFICATION
+   REQUIRED" section.
+
 1. **Mixed causal / bidirectional per request.** SDPA's built-in masks are
    `top_left` / `bottom_right` causal or a **buffer mask**
    (`dnnl_attn_mask_buffer`, `sdpa_types.hpp:44-55`; 4D, `mask_q/k_index`).
@@ -245,6 +278,13 @@ RoPE, gather, mask/router builders) in SYCL.**
    sliding-vs-full head dims fit the Xe2 micro-kernel's `d_max`
    (`sdpa/micro.hpp:347`, `configs.cpp`). If not, fall back to
    matmul+softmax+matmul (all reusable) for the oversized layers.
+1b. **Sliding-window compute scaling (the `k0start` hypothesis).** *Highest-
+   priority unverified claim.* Benchmark the current mask-buffer SWA path vs the
+   proposed `k0start` patch on Xe2, sweeping sequence length at fixed window `W`,
+   and validate correctness vs the dense reference. Only adopt the patch if the
+   current kernel demonstrably scales `O(seq²)` for local layers; drop it if it
+   already plateaus. Details + diff:
+   `patches/onednn_sdpa_sliding_window_k0start.patch`.
 2. **Bidirectional masking cost.** Validate that a float additive mask buffer
    on Xe2 doesn't defeat the micro-kernel's causal-skip optimization for the
    *encoder* rows; if it does, consider a per-seq causal predicate patch.

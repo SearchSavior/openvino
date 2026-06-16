@@ -1,0 +1,121 @@
+From: DiffusionGemma/Xe2 backend investigation
+Subject: [GIST/UNVERIFIED] sdpa micro-kernel: add sliding-window key lower bound (k0start)
+
+WHAT / WHY
+----------
+oneDNN's micro SDPA kernel (src/gpu/intel/sdpa/micro.cl) already trims the
+*upper* key range for causal masks via `k0end` (FlashAttention-style block
+skipping). It has NO *lower* key bound: the K-loop always starts at key 0.
+
+Gemma3/Gemma4 (and DiffusionGemma) use HYBRID attention: most layers are
+`sliding_attention` (local window W), interleaved with a few `full_attention`
+layers. Today the only way to run a sliding-window layer through this kernel is
+to pass the window as an additive `attn_mask` buffer (-inf outside the band).
+That is functionally correct but computes the ENTIRE lower key range and masks
+it: O(seq * k0end) work instead of SWA's O(seq * W).
+
+This patch adds a symmetric `k0start` lower bound so out-of-window key blocks
+are skipped entirely, mirroring the existing `k0end` logic.
+
+STATUS: ILLUSTRATIVE / UNVERIFIED. This shows the .cl-side change only. It has
+NOT been compiled, run, or benchmarked. See "VERIFICATION REQUIRED" below.
+The host-side plumbing (descriptor field + kernel defines + dispatch gating) is
+NOT included here and is required for this to do anything.
+
+ASSUMPTIONS TO CHECK
+--------------------
+* `ugemm_kq(..., k0end, ..., d, k0, 0, 0, ...)` uses `k0` as the K row offset
+  (micro.cl:816-817), so changing only the loop start is sufficient for the
+  GEMM to address the correct keys — no K base-pointer rebasing needed for the
+  matmul itself.
+* `first` (micro.cl:770 -> used at :984) gates online-softmax accumulator init;
+  it must become `(k0 == k0start)`, else the first in-window block wrongly
+  rescales the accumulator.
+* The first-K prefetch (micro.cl:669-682) still prefetches from row 0; with
+  k0start>0 it warms a skipped tile. Correctness-neutral, perf-suboptimal —
+  flagged as a TODO, not fixed here.
+* The `if (k0end > 0)` setup/epilogue guards (628,647,670,713,735,1145,1207)
+  assume "any work => start at 0". With windowing the precise predicate is
+  `k0end > k0start`; left as-is here because in SWA every valid query attends at
+  least itself so k0end > k0start always holds. Revisit for fully-masked rows.
+
+--- a/src/gpu/intel/sdpa/micro.cl
++++ b/src/gpu/intel/sdpa/micro.cl
+@@ -536,6 +536,10 @@
+     /* Calculate the number of keys to process */
+     int k0end = k;
++    /* Lower bound on keys to process. 0 for full/causal attention; raised for
++     * sliding-window (local) attention so out-of-window key blocks are skipped
++     * entirely instead of being computed and then masked to -inf. */
++    int k0start = 0;
+ #if WITH_CAUSAL_MASK
+     if (attn_mask_type == ATTN_MASK_TOP_LEFT) {
+         k0end = min(k, (int)(wg_j0 + ugemm_kq_wg_tile_n));
+         if (q == 1) k0end = 1;
+     } else {
+         k0end = min(k, (int)(wg_j0 + ugemm_kq_wg_tile_n) - (q - k));
+     }
+ #endif
++#if WITH_SLIDING_WINDOW
++    /* Lowest key any query in this workgroup tile attends:
++     *   query rows in tile = [wg_j0, wg_j0 + ugemm_kq_wg_tile_n)
++     *   each query q attends keys in (q - SLIDING_WINDOW, q]
++     * Use the tile's minimum query row (wg_j0) and align DOWN to the K block
++     * size so GEMM tiling stays aligned. The (q - k) shift mirrors the
++     * bottom_right branch of the k0end computation above. */
++    int win_lo = (int)wg_j0 - (int)SLIDING_WINDOW + 1;
++#if WITH_CAUSAL_MASK
++    if (attn_mask_type != ATTN_MASK_TOP_LEFT) win_lo -= (q - k);
++#endif
++    k0start = max(0, win_lo);
++    k0start = (k0start / ugemm_kq_wg_tile_m) * ugemm_kq_wg_tile_m;
++#endif
+
+     /* Leading dimension for matrices */
+     uint ldk = TRANSPOSE_K ? KEY_S3 : KEY_S2;
+@@ -766,8 +770,8 @@
+     /* Main loop over key blocks */
+-    for (int k0 = 0; k0 < k0end; k0 += ugemm_kq_wg_tile_m) {
+-        bool first = (k0 == 0);
++    for (int k0 = k0start; k0 < k0end; k0 += ugemm_kq_wg_tile_m) {
++        bool first = (k0 == k0start);
+         int knext = k0 + ugemm_kq_wg_tile_m;
+         bool last = (knext >= k0end);
+
+
+REQUIRED HOST-SIDE PLUMBING (not in this gist; sketch only)
+-----------------------------------------------------------
+1. src/common/sdpa_types.hpp : add `dim_t sliding_window {};` to sdpa_desc_t
+   (0 = disabled), plus an accessor.
+2. src/gpu/intel/sdpa/micro.cpp : when sliding_window > 0, emit kernel defines
+   `-DWITH_SLIDING_WINDOW=1 -DSLIDING_WINDOW=<W>` alongside the existing
+   WITH_CAUSAL_MASK / attn_mask_type defines; gate dispatch/config as needed.
+3. Plumb sliding_window from the Graph API SDP partition (or the internal PD
+   creation path) down into sdpa_desc_t.
+4. Decide interaction with attn_mask buffer: with a real k0start, the additive
+   band mask for the *skipped* region is no longer needed; the in-window
+   remainder edges may still need masking.
+
+VERIFICATION REQUIRED (the hypothesis this patch rests on)
+----------------------------------------------------------
+The CLAIM is: "for Gemma sliding layers on long sequences, mask-buffer SWA on
+the current kernel pays full lower-range compute, and k0start recovers SWA's
+O(seq*W) cost." This is UNPROVEN. Before relying on it:
+
+A. CORRECTNESS: build oneDNN with the full plumbing, run sdpa with a window and
+   compare outputs against (a) the dense reference (ref.cl) with an equivalent
+   additive band mask, and (b) a PyTorch/vLLM SWA reference. Bit-for-bit class
+   match within tolerance.
+
+B. PERF / NECESSITY: benchmark the CURRENT kernel (window via additive mask, no
+   k0start) vs the PATCHED kernel, sweeping sequence length (e.g. 512 ... 32k)
+   at fixed window W. Confirm:
+     - current kernel runtime scales ~O(seq) per query (i.e. O(seq^2) total) —
+       i.e. it does NOT already cap work at the window, and
+     - patched kernel runtime flattens to ~O(W) per query for seq >> W.
+   If the current kernel already plateaus (e.g. a higher layer caps k0end, or
+   the mask makes the GEMM cheap enough), THIS PATCH IS UNNECESSARY and should
+   be dropped. Short canvases / short contexts likely see no benefit.
+
+C. Confirm Xe2 specifically: measure on the actual Xe2 dGPU target, not just
+   functional emulation, since the win is bandwidth/EU-occupancy dependent.
