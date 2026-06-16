@@ -69,6 +69,79 @@ concentrated in (a) the diffusion sampler, (b) RoPE, (c) embedding gather, and
 (d) the per-sequence attention-mask construction that encodes
 encoder-vs-denoise phase.
 
+> **The core thesis (§1A):** unlike an autoregressive model, DiffusionGemma
+> keeps the **XMX/DPAS systolic arrays saturated during *decode* as well as
+> prefill**, because every denoising step is a fat GEMM over the whole canvas,
+> not a skinny GEMV over one token. This is *the* reason the model is an unusually
+> good fit for Xe2, and it reorders the optimization priorities.
+
+---
+
+## 1A. Why Xe2/XMX Is an Unusually Good Fit (the core thesis)
+
+Xe2 dGPUs derive most of their FLOPs from **XMX** (Xe Matrix Extensions — the
+DPAS systolic arrays), reached in oneDNN through the `src/gpu/intel/gemm/jit`
+systolic path. XMX is only efficient on **GEMM-shaped** work with a large enough
+`M` (rows) to fill the systolic tiles; on **GEMV-shaped** work (`M≈1`) it is
+starved and the kernel becomes **memory-bandwidth-bound** on weight reads.
+
+That distinction is exactly where autoregressive (AR) and diffusion decoding
+diverge:
+
+| | AR decode | DiffusionGemma decode |
+|---|---|---|
+| Tokens processed per forward pass | **1 per request** (`M = num_reqs`, ≤8) | **whole canvas per request** (`M = num_decode × canvas_length`) |
+| GEMM shape | skinny **GEMV** | fat **GEMM** |
+| Weight reuse per pass | each weight used ~once → low arithmetic intensity | each weight reused `canvas_length×` → high arithmetic intensity |
+| Bottleneck | **memory bandwidth** (XMX idle) | **XMX compute** (arrays saturated) |
+| Sequential steps to emit N tokens | **N** passes | **S** denoising steps (S ≈ ≤48, often fewer via early convergence) |
+
+**Grounded in the code.** A decode step runs the backbone over the full canvas:
+`per_req_nlogits == canvas_length` and the model processes
+`num_decode × canvas_length` tokens (`diffusion_gemma.py:474, 603`,
+`prepare_inputs`). The canvas default is **256** (`diffusion_gemma.py` /
+`configs/diffusion_gemma.py:31`, `models/config.py:144`). So with
+`max_num_seqs=8` the decode-time GEMM `M` is up to **8 × 256 = 2048** — squarely
+in the XMX-efficient regime — versus `M ≤ 8` for AR decode.
+
+### Consequences (these reorder the priorities)
+
+1. **The matmul / gated_mlp / SDPA reuse is even more valuable than the FLOP
+   share suggests.** Those *are* the XMX kernels, and here they run hot in
+   **both** phases. Targeting the DPAS systolic GEMM path for *every* projection
+   (qkv/o/gate/up/down/lm_head) pays off in decode, not just prefill.
+
+2. **Efficiency no longer depends on cross-request batching.** AR needs many
+   concurrent requests to fill the GEMM `M`; DiffusionGemma fills `M` from the
+   canvas *within a single request*. This is fortunate, because the fp32
+   `[seqs, canvas, vocab]` sampler transient caps `max_num_seqs` at 8
+   (`models/config.py:149-159`) — we don't need high concurrency for XMX
+   occupancy.
+
+3. **The optimization target shifts from "bandwidth/GEMV latency" to "denoising
+   steps `S` × XMX tile occupancy".** The AR playbook (KV-cache bandwidth,
+   flash-decoding GEMV kernels, speculative decode to dodge GEMV) is largely
+   irrelevant. What matters is: (a) minimize `S` — entropy-bound acceptance and
+   confidence/stability early convergence (`diffusion_gemma.py:545-621`); and
+   (b) keep each step's canvas GEMM in the efficient DPAS regime.
+
+4. **Attention is also GEMM-shaped in decode.** Because a step has
+   `canvas_length` queries (not 1), the SDPA `ugemm` KQ/VS matmuls are
+   DPAS-friendly — unlike AR flash-decoding, which is a batch-1 GEMV. This makes
+   the `sdpa` micro-kernel a strong fit in decode too (and tempers the urgency of
+   the sliding-window `k0start` patch for small canvases, §3.2).
+
+5. **More raw FLOPs, but at far higher utilization.** Diffusion does ~`S×`
+   the token-passes of AR for the same tokens, yet runs them as saturated GEMMs
+   instead of starved GEMVs. On an XMX-heavy part like Xe2 the higher *effective*
+   throughput, plus fewer *sequential* steps (`S < canvas_length`), is the win —
+   and `S` is itself reducible by the sampler's early-exit logic.
+
+**Net:** the backend should treat decode like a second prefill — same XMX GEMM
+kernels, same tiling concerns — and spend its optimization budget on cutting `S`
+and maximizing DPAS occupancy of the canvas GEMM, not on the bandwidth-oriented
+tricks an AR engine needs.
+
 ---
 
 ## 2. oneDNN Surface Area on Xe2
