@@ -167,9 +167,9 @@ Without the KV cache, every denoise step would re-encode the prefix at `O(seq)`
 — the cache is what keeps decode at canvas-bounded compute. (The live canvas's
 own K/V change every step as it is refined, so they are recomputed each step for
 the in-canvas bidirectional self-attention and only the committed result is
-persisted — but that is only `CL` wide, so it is cheap.) This is also exactly
-where the sliding-window `k0start` skip (§3.2) pays off: most of the frozen past
-KV is out-of-window for a local layer.
+persisted — but that is only `CL` wide, so it is cheap.) For sliding layers, our
+KV cache presents only the last `W` keys, so most of the frozen past is simply
+never read (§3.2).
 
 ### Consequences (these reorder the priorities)
 
@@ -313,18 +313,8 @@ The three gaps:
    `O(canvas_length · W · d)` and **KV memory is bounded to `W`** (the larger
    prize). Global layers present the full context. This is purely a
    data-presentation decision in our KV cache; no attention-kernel windowing
-   logic is required.
-
-   *oneDNN-internals note (not in scope):* the `sdpa` micro-kernel itself has no
-   window parameter — it trims the causal **upper** key bound via `k0end`
-   (`micro.cl:536-545, 769`) but has no **lower** bound, and `sdpa_desc_t`
-   exposes no window field (`sdpa_types.hpp:43-55`). That would only matter to
-   someone feeding it full KV and relying on an additive mask to fake the window
-   — which we are not doing, because we present `W` keys at the cache level.
-   `patches/onednn_sdpa_sliding_window_k0start.patch` documents that kernel
-   limitation as a reference artifact; **it is not part of this from-scratch
-   plan.** Canvas tiling separately bounds the *query* side to `M = canvas_length`
-   (§1A); cache-level windowing bounds the *key* side.
+   logic is required. Canvas tiling separately bounds the *query* side to
+   `M = canvas_length` (§1A); cache-level windowing bounds the *key* side.
 
 1. **Mixed causal / bidirectional per request.** SDPA's built-in masks are
    `top_left` / `bottom_right` causal or a **buffer mask**
@@ -422,9 +412,7 @@ RoPE, gather, mask/router builders) in SYCL.**
    per-layer sliding-window KV cache (mirror vLLM's `SlidingWindowSpec`) so
    sliding layers store/present only ~`W` keys — this bounds both attention
    compute and KV memory, and whatever attention primitive we call sees only `W`
-   keys. No oneDNN kernel change is involved. (The
-   `patches/onednn_sdpa_sliding_window_k0start.patch` file is a reference note on
-   the `sdpa` kernel's internals, not part of the plan.)
+   keys. No oneDNN kernel change is involved.
 2. **Bidirectional masking cost.** Validate that a float additive mask buffer
    on Xe2 doesn't defeat the micro-kernel's causal-skip optimization for the
    *encoder* rows; if it does, consider a per-seq causal predicate patch.
