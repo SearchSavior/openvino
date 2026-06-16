@@ -136,6 +136,41 @@ therefore: **shrink `S`** (axis 2) and **grow `canvas_length`** to cut the block
 count (axis 3) — the latter bounded by XMX occupancy, the fp32 sampler
 transient, and whether a larger block needs more steps to converge.
 
+### Bounding per-step cost: tile the canvas, freeze the past in KV
+
+The reason this is tractable at all is the YOCO encoder/decoder split, which is
+exactly a "compute only the current canvas, keep previous canvases as frozen KV"
+scheme:
+
+- **Commit step = encoder pass** (`is_encoder_phase=True`, causal): the finalized
+  canvas is written to the paged KV cache — now **frozen K/V**.
+- **Denoise steps = decoder pass** (`is_encoder_phase=False`, bidirectional,
+  *read-only* against the cache, `diffusion_gemma.py:7`): the **only query tile
+  computed is the current canvas** (`num_decode × canvas_length`,
+  `:474, 603`). It attends to `[frozen past KV from cache] +
+  [its own freshly-computed canvas K/V]`. `prepare_attn` feeds the kernel the
+  full-context `block_tables`/`slot_mappings`/`seq_lens` — standard paged KV,
+  identical to AR; the past is encoded **once**, not re-encoded per step.
+
+Per-denoise-step cost under this scheme:
+
+| Work | Cost / step | Scales with seq len? |
+|---|---|---|
+| Projection + MLP GEMMs (qkv/o/gate/up/down) | `O(canvas_length · d)`, **M = CL fixed** | **No** |
+| Attention — **global** layers | `O(canvas_length · context · d)` | Yes (KV grows) |
+| Attention — **sliding** layers | `O(canvas_length · min(context, W) · d)` | Bounded by `W` |
+
+The key point: the **XMX-bound bulk (projections/MLP) is pinned at `M =
+canvas_length` regardless of total sequence length** — only attention's KV
+dimension grows, and on Gemma's majority sliding layers it is capped at `W`.
+Without the KV cache, every denoise step would re-encode the prefix at `O(seq)`
+— the cache is what keeps decode at canvas-bounded compute. (The live canvas's
+own K/V change every step as it is refined, so they are recomputed each step for
+the in-canvas bidirectional self-attention and only the committed result is
+persisted — but that is only `CL` wide, so it is cheap.) This is also exactly
+where the sliding-window `k0start` skip (§3.2) pays off: most of the frozen past
+KV is out-of-window for a local layer.
+
 ### Consequences (these reorder the priorities)
 
 1. **The matmul / gated_mlp / SDPA reuse is even more valuable than the FLOP
