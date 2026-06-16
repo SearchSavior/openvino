@@ -49,7 +49,7 @@ primitives.
 | RoPE | none | **AUTHOR SYCL** | — |
 | Attention (SDPA) | internal `sdpa` micro-kernel | **REUSE w/ gaps** | `src/gpu/intel/sdpa/micro.*` |
 | ↳ `full_attention` layers (~1 in 6) | causal block-skip (`k0end`) + GQA | **REUSE (efficient)** | `micro.cl:536-545` |
-| ↳ `sliding_attention` layers (majority) | bound KV to `W` in the cache (à la `SlidingWindowSpec`) | **REUSE via cache-level windowing** (kernel patch = contingency) | `kv_cache_interface.py:472` |
+| ↳ `sliding_attention` layers (majority) | present only ~`W` keys from our SYCL KV cache | **REUSE** — our KV cache bounds the window; primitive sees `W` keys | `kv_cache_interface.py:472` |
 | ↳ mixed causal/bidirectional per-seq mask | `attn_mask` *buffer* (float additive) | **REUSE via mask buffer** | `sdpa_types.hpp:44-55` |
 | ↳ logit soft-capping inside attn | Graph API `optional_soft_capping` | **REUSE via Graph API** | `patterns/sdp.cpp:148`, `utils.hpp:453` |
 | MoE / gated MLP | internal `gated_mlp` (gate+act+mul+down) | **REUSE w/ gaps** | `gated_mlp/ref.hpp:49-59` |
@@ -196,8 +196,8 @@ KV is out-of-window for a local layer.
    `canvas_length` queries (not 1), the SDPA `ugemm` KQ/VS matmuls are
    DPAS-friendly — unlike AR flash-decoding, which is a batch-1 GEMV. This makes
    the `sdpa` micro-kernel a strong fit in decode too. Sliding-window efficiency
-   is handled by **cache-level windowing** (bound stored KV to `W`), not a kernel
-   patch (§3.2) — so the kernel sees only `CL` queries × `min(context, W)` keys.
+   falls out of **our own KV cache presenting only ~`W` keys** for sliding layers
+   (§3.2) — so the primitive sees only `CL` queries × `min(context, W)` keys.
 
 5. **More raw FLOPs, but at far higher utilization — *not* unconditionally
    fewer sequential steps.** Diffusion does ~`(S+1)×` the token-passes of AR per
@@ -226,7 +226,7 @@ is a hard sequential floor, so don't bank on parallelizing across blocks.
    subgroup size, GRF, EU/thread queries.
 2. **`src/gpu/generic/sycl/`** — a **portable SYCL reference** backend: `ref_*`
    kernels for eltwise, binary, reduction, layer/group norm, softmax, matmul,
-   reorder, etc. (`src/gpu/generic/sycl/`). Useful as correctness fallback and
+   reorder, etc. (`src/gpu/generic/sycl/`). Useful as a correctness reference and
    as a template for *authoring our own SYCL kernels* in the same idiom.
 
 For Xe2 we want the `intel/` kernels for the heavy ops; the `generic/sycl/`
@@ -299,44 +299,32 @@ supports everything the backbone needs:
   `global_head_dim` fits the micro-kernel's supported range on Xe2.
 
 The three gaps:
-0. **Sliding-window (local) attention efficiency.** Gemma4 is *hybrid*: most
-   layers are `sliding_attention` (local window `W`), interleaved with a few
+0. **Sliding-window (local) attention — handled by our own KV cache, not a
+   concern for the oneDNN call.** Gemma4 is *hybrid*: most layers are
+   `sliding_attention` (local window `W`), interleaved with a few
    `full_attention` layers (`gemma4.py:435-437, 560-562`; typically a 5:1 ratio).
-   The micro-kernel reads each layer's keys in a tiled loop
-   `for (k0 = 0; k0 < k0end; ...)` (`micro.cl:769`) and already trims the
-   **upper** key bound for causal masks via `k0end`
-   (`micro.cl:536-545`) — FlashAttention-style block skipping. **But there is no
-   *lower* bound**: the loop always starts at key 0, and `sdpa_desc_t` has **no
-   window field** (mask types are only `undef/buffer/top_left/bottom_right`,
-   `sdpa_types.hpp:43-55`). So a sliding window can only be expressed as an
-   additive `attn_mask` buffer, which the kernel computes-then-masks over the
-   full lower range — i.e. `O(seq²/2)` per local layer rather than SWA's
-   `O(seq·W)`. This is **functionally correct reuse but loses SWA's compute
-   saving** on long contexts. For the `full_attention` layers (~1 in 6, also the
-   `k_eq_v` layers) reuse is efficient as-is.
+   Since we author the KV cache from scratch in SYCL, **we decide which keys to
+   present to the attention primitive.** For a sliding layer we store/present
+   only the last ~`W` keys (the well-known per-layer sliding-window KV design;
+   vLLM's `SlidingWindowSpec` allocates `cdiv(W, block_size)+1` blocks per layer,
+   `vllm/v1/kv_cache_interface.py:472`, `simple_kv_offload/manager.py:217-218`).
+   Whatever attention primitive we then call — oneDNN `sdpa`, or our own
+   matmul+softmax+matmul in SYCL — sees only those ~`W` keys, so attention stays
+   `O(canvas_length · W · d)` and **KV memory is bounded to `W`** (the larger
+   prize). Global layers present the full context. This is purely a
+   data-presentation decision in our KV cache; no attention-kernel windowing
+   logic is required.
 
-   **PREFERRED FIX — windowing belongs in the KV cache, not the kernel.** The
-   right lever is to **bound the stored/presented KV to `W` for sliding layers**,
-   exactly as vLLM does with a per-layer `SlidingWindowSpec` (allocates only
-   `cdiv(sliding_window, block_size) + 1` blocks per sliding layer,
-   `vllm/v1/kv_cache_interface.py:472`,
-   `vllm/v1/simple_kv_offload/manager.py:217-218`). If our oneDNN/SYCL Xe2 backend's
-   paged KV cache replicates this, the block table for a sliding layer points at
-   only ~`W` keys, so the SDPA kernel is *handed* ~`W` keys and its existing
-   `k0end` loop naturally iterates only those — **no kernel change needed** — and,
-   more importantly, **KV memory is bounded to `W`** (the larger prize). This
-   supersedes the kernel patch for the common case.
-
-   **Kernel patch is now a CONTINGENCY (deprioritized).** A symmetric `k0start`
-   lower bound in `micro.cl` (gist diff:
-   [`patches/onednn_sdpa_sliding_window_k0start.patch`](patches/onednn_sdpa_sliding_window_k0start.patch))
-   only matters in a fallback design where sliding layers store *full* KV and
-   rely on an additive mask — which we should avoid anyway for the memory reason.
-   So unless cache-level windowing is infeasible, **don't pursue the patch.** It
-   remains UNVERIFIED and, if ever needed, still requires the correctness + Xe2
-   perf checks in the patch file's "VERIFICATION REQUIRED" section. Note also that
-   canvas tiling already bounds the *query* side to `M = canvas_length` (§1A); the
-   patch was only ever about the *key* side, which cache-level windowing handles.
+   *oneDNN-internals note (not in scope):* the `sdpa` micro-kernel itself has no
+   window parameter — it trims the causal **upper** key bound via `k0end`
+   (`micro.cl:536-545, 769`) but has no **lower** bound, and `sdpa_desc_t`
+   exposes no window field (`sdpa_types.hpp:43-55`). That would only matter to
+   someone feeding it full KV and relying on an additive mask to fake the window
+   — which we are not doing, because we present `W` keys at the cache level.
+   `patches/onednn_sdpa_sliding_window_k0start.patch` documents that kernel
+   limitation as a reference artifact; **it is not part of this from-scratch
+   plan.** Canvas tiling separately bounds the *query* side to `M = canvas_length`
+   (§1A); cache-level windowing bounds the *key* side.
 
 1. **Mixed causal / bidirectional per request.** SDPA's built-in masks are
    `top_left` / `bottom_right` causal or a **buffer mask**
@@ -430,14 +418,13 @@ RoPE, gather, mask/router builders) in SYCL.**
    sliding-vs-full head dims fit the Xe2 micro-kernel's `d_max`
    (`sdpa/micro.hpp:347`, `configs.cpp`). If not, fall back to
    matmul+softmax+matmul (all reusable) for the oversized layers.
-1b. **Sliding-window handling = cache-level windowing (preferred), not the
-   kernel patch.** Implement a per-layer sliding-window KV cache in the
-   oneDNN/SYCL Xe2 backend (mirror vLLM's `SlidingWindowSpec`) so sliding layers
-   store/present only ~`W` keys — this bounds both attention compute and KV
-   memory, and the SDPA kernel needs no change. Verify the chosen KV-cache impl
-   actually does this. The `k0start` kernel patch
-   (`patches/onednn_sdpa_sliding_window_k0start.patch`) is now a **contingency**
-   only for a full-KV+mask fallback; deprioritized and still unverified.
+1b. **Sliding window is a KV-cache design task in our SYCL code.** Author the
+   per-layer sliding-window KV cache (mirror vLLM's `SlidingWindowSpec`) so
+   sliding layers store/present only ~`W` keys — this bounds both attention
+   compute and KV memory, and whatever attention primitive we call sees only `W`
+   keys. No oneDNN kernel change is involved. (The
+   `patches/onednn_sdpa_sliding_window_k0start.patch` file is a reference note on
+   the `sdpa` kernel's internals, not part of the plan.)
 2. **Bidirectional masking cost.** Validate that a float additive mask buffer
    on Xe2 doesn't defeat the micro-kernel's causal-skip optimization for the
    *encoder* rows; if it does, consider a per-seq causal predicate patch.

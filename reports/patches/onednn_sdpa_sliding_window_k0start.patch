@@ -1,7 +1,17 @@
 From: DiffusionGemma/Xe2 backend investigation
-Subject: [GIST/UNVERIFIED] sdpa micro-kernel: add sliding-window key lower bound (k0start)
+Subject: [REFERENCE NOTE / NOT IN SCOPE] sdpa micro-kernel: sliding-window key lower bound (k0start)
 
-WHAT / WHY
+SCOPE NOTE
+----------
+This file documents a *limitation of oneDNN's internal sdpa micro-kernel*. It is
+NOT part of the from-scratch SYCL + oneDNN-primitives plan. In our design the KV
+cache is authored from scratch and presents only ~W keys for sliding layers, so
+the attention primitive never sees out-of-window keys and no kernel change is
+needed (see survey report Section 3.2, gap 0). Keep this only as a record of how
+oneDNN's sdpa kernel behaves, in case anyone ever calls it with full KV + an
+additive window mask (which we are not doing).
+
+WHAT / WHY (the oneDNN-internals observation)
 ----------
 oneDNN's micro SDPA kernel (src/gpu/intel/sdpa/micro.cl) already trims the
 *upper* key range for causal masks via `k0end` (FlashAttention-style block
