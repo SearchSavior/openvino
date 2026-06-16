@@ -94,7 +94,7 @@ diverge:
 | GEMM shape | skinny **GEMV** | fat **GEMM** |
 | Weight reuse per pass | each weight used ~once → low arithmetic intensity | each weight reused `canvas_length×` → high arithmetic intensity |
 | Bottleneck | **memory bandwidth** (XMX idle) | **XMX compute** (arrays saturated) |
-| Sequential steps to emit N tokens | **N** passes | **S** denoising steps (S ≈ ≤48, often fewer via early convergence) |
+| Sequential passes to emit N tokens | **N** (one per token) | **(N/canvas_length) × (S+1)** (blocks × denoise+commit) |
 
 **Grounded in the code.** A decode step runs the backbone over the full canvas:
 `per_req_nlogits == canvas_length` and the model processes
@@ -103,6 +103,38 @@ diverge:
 `configs/diffusion_gemma.py:31`, `models/config.py:144`). So with
 `max_num_seqs=8` the decode-time GEMM `M` is up to **8 × 256 = 2048** — squarely
 in the XMX-efficient regime — versus `M ≤ 8` for AR decode.
+
+### What is and isn't parallel (the limit of the speedup)
+
+The XMX win comes from **spatial** parallelism only. There are three dependency
+axes, and bidirectional attention removes just one of them:
+
+1. **Across canvas positions (spatial): fully parallel.** All `canvas_length`
+   positions of the *current* block are refined together — this is what makes
+   the decode matmuls fat GEMMs. This is the entire XMX advantage.
+2. **Across denoising steps (temporal): sequential.** Step `t+1` consumes step
+   `t`'s renoised canvas plus self-conditioning embeds, so the `S` steps of a
+   block cannot be parallelized. `S` is *reducible* (entropy-bound acceptance +
+   confidence/stability early convergence, `diffusion_gemma.py:545-621`) but
+   bounded below by however many refinements the block needs.
+3. **Across canvas blocks (autoregressive): sequential and IRREDUCIBLE.** This
+   is "block diffusion" (the registry name is `DiffusionGemmaForBlockDiffusion`):
+   block `k+1`'s context is block `k`'s committed tokens, made visible only after
+   the commit step writes them to KV via the causal/encoder pass
+   (`is_encoder_phase` cycle: `:732` → `:1146` → `:619` → commit `:603`). Block
+   `k+1` cannot begin until block `k` commits. **Bidirectional attention does
+   not weaken this** — it is confined to the live canvas; past blocks are frozen
+   KV attended to *causally*.
+
+So we **cannot** reduce sequentiality below the block structure. To emit `N`
+tokens we pay `⌈N / canvas_length⌉` sequential blocks, each `S+1` sequential
+passes ≈ `(N/canvas_length)·(S+1)` total. This beats AR's `N` sequential passes
+**only if `S+1 < canvas_length`** (e.g. `S≈10–48`, `CL=256` → ~5–25× fewer
+*passes*) — and even when the pass count isn't lower, each pass does `CL`
+positions of XMX-efficient work instead of one GEMV. The two real levers are
+therefore: **shrink `S`** (axis 2) and **grow `canvas_length`** to cut the block
+count (axis 3) — the latter bounded by XMX occupancy, the fp32 sampler
+transient, and whether a larger block needs more steps to converge.
 
 ### Consequences (these reorder the priorities)
 
@@ -131,16 +163,19 @@ in the XMX-efficient regime — versus `M ≤ 8` for AR decode.
    the `sdpa` micro-kernel a strong fit in decode too (and tempers the urgency of
    the sliding-window `k0start` patch for small canvases, §3.2).
 
-5. **More raw FLOPs, but at far higher utilization.** Diffusion does ~`S×`
-   the token-passes of AR for the same tokens, yet runs them as saturated GEMMs
-   instead of starved GEMVs. On an XMX-heavy part like Xe2 the higher *effective*
-   throughput, plus fewer *sequential* steps (`S < canvas_length`), is the win —
-   and `S` is itself reducible by the sampler's early-exit logic.
+5. **More raw FLOPs, but at far higher utilization — *not* unconditionally
+   fewer sequential steps.** Diffusion does ~`(S+1)×` the token-passes of AR per
+   block, yet runs them as saturated GEMMs instead of starved GEMVs. The
+   *sequential-pass* advantage exists only when `S+1 < canvas_length` (see the
+   parallelism section); the block-autoregressive floor `⌈N/canvas_length⌉` is
+   irreducible. The robust win is the **utilization** one (GEMM vs GEMV), which
+   holds regardless; the latency/pass-count win is conditional on `S`.
 
 **Net:** the backend should treat decode like a second prefill — same XMX GEMM
 kernels, same tiling concerns — and spend its optimization budget on cutting `S`
-and maximizing DPAS occupancy of the canvas GEMM, not on the bandwidth-oriented
-tricks an AR engine needs.
+(within-block) and maximizing DPAS occupancy of the canvas GEMM, not on the
+bandwidth-oriented tricks an AR engine needs. The block-to-block autoregression
+is a hard sequential floor, so don't bank on parallelizing across blocks.
 
 ---
 
