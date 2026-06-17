@@ -213,6 +213,68 @@ kernels, same tiling concerns — and spend its optimization budget on cutting `
 bandwidth-oriented tricks an AR engine needs. The block-to-block autoregression
 is a hard sequential floor, so don't bank on parallelizing across blocks.
 
+### Optimizing KV across denoising steps
+
+Within one block, the `S` denoise steps see **two KV populations** that behave
+oppositely:
+
+| | Frozen KV (prompt + committed blocks) | Canvas K/V (current block) |
+|---|---|---|
+| Changes across the `S` steps? | **No** — identical every step | **Yes** — canvas tokens are re-sampled each step |
+| Computed | once, at commit → paged cache | recomputed every denoise step |
+| Persisted? | yes (read-only thereafter) | no — regenerated until commit |
+
+**Reframe — frozen KV is read `S×` but that is *not* the bottleneck.** The
+tempting target is the `S×` re-read of frozen KV per block. But a denoise step
+issues **`CL` queries at once**, so each frozen-KV read is amortized across the
+whole canvas: arithmetic intensity ≈ `CL · gqa_ratio / dtype_bytes` (~hundreds
+of FLOP/byte at `CL=256`), well above Xe2's ridge point. So **frozen-KV
+attention is compute-bound**, not bandwidth-bound — diffusion has none of AR
+decode's KV-bandwidth wall (where intensity ≈ 1–2 FLOP/byte, `CL=1`). The real
+cross-step waste is **redundant FLOPs** (`S` full forward passes over `CL`
+tokens, including already-locked positions) and, secondarily, HBM traffic/power.
+
+Optimizations, ranked (exactness noted):
+
+1. **Canvas K/V on-chip, never in the paged HBM cache (exact; design).** During
+   denoise the canvas K/V are read-only-this-step and discarded; only the commit
+   pass writes the canonical *causal* KV. Compute canvas K/V in SLM/registers per
+   step (flash-style) and allocate no paged slots for them — no HBM churn for the
+   ephemeral block.
+2. **Frozen-KV L2 residency across the `S` back-to-back steps (exact;
+   scheduling).** The `S` steps run consecutively over identical frozen KV.
+   Schedule the per-block loop to keep frozen KV hot in L2 → `1×` HBM + `S×` L2
+   instead of `S×` HBM. Cuts traffic/power even though we are compute-bound.
+3. **Frozen-KV quantization (near-exact; bandwidth/footprint).** oneDNN `sdpa`
+   already supports KV scales/zero-points (`kq_scales`/`vs_scales`,
+   `sdpa_types.hpp:82-85`). int8/fp8 frozen KV is *more* valuable than in AR
+   because the saving multiplies over the `S×` reads and the long residency.
+4. **Sliding-window cache bound (exact).** Local layers present only `W` keys
+   (§3.2), capping frozen KV and its `S×` reads regardless of context length.
+5. **Progressive freezing / query-set pruning (APPROXIMATE — biggest FLOP
+   save; must validate accuracy).** The only lever on the dominant cost. The
+   sampler already knows which positions are locked (entropy-bound accept mask +
+   stability/convergence, `diffusion_gemma.py:545-621`). Once a position locks,
+   its committed token is fixed; if we freeze its K/V and stop recomputing its
+   query/MLP, the active query set `M` shrinks from `CL` toward 0 as the block
+   converges, cutting the canvas projection/MLP GEMMs and the self-attention.
+   *Catch:* bidirectional coupling means a locked position's true K/V would still
+   drift as neighbors change, so this is an approximation — tolerable only if it
+   holds up against full-recompute accuracy. Validate before adopting.
+6. **Skip embed + self-conditioning recompute for unchanged positions (exact;
+   minor).** Gate the embedding lookup and SC MLP on the sampler's change mask.
+
+What is **not** possible:
+- *Cache frozen-KV attention scores across steps* — `Q_canvas` changes every
+  step, so `Q·K_frozen` cannot be reused even though `K_frozen` is constant.
+- *Batch the `S` steps* — strictly sequential (step `t+1` consumes step `t`'s
+  renoised canvas + self-conditioning).
+- *Exactly skip locked-position recompute* — bidirectional attention couples all
+  positions; only the approximate freezing in (5) gets around it.
+- *Reuse the last denoise step's canvas K/V for the commit write* — denoise
+  computes them under *bidirectional* attention; the commit needs *causal* KV
+  for future blocks, a genuinely different result.
+
 ---
 
 ## 2. oneDNN Surface Area on Xe2
