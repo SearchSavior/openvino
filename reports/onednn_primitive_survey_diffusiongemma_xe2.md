@@ -221,8 +221,22 @@ oppositely:
 | | Frozen KV (prompt + committed blocks) | Canvas K/V (current block) |
 |---|---|---|
 | Changes across the `S` steps? | **No** — identical every step | **Yes** — canvas tokens are re-sampled each step |
-| Computed | once, at commit → paged cache | recomputed every denoise step |
+| Computed | incrementally at commit → cache | recomputed every denoise step |
 | Persisted? | yes (read-only thereafter) | no — regenerated until commit |
+
+This is confirmed directly by the HF reference (transformers 5.12.1). The
+decoder attention is read-only against the encoder cache and recomputes + concats
+canvas K/V every step:
+`DiffusionGemmaDecoderTextAttention` "doesn't update the KV cache in the forward
+pass … read-only encoder KV cache" (`modeling_diffusion_gemma.py:374-377`);
+`key_states = self.k_proj(hidden_states)` … `torch.cat([encoder_key_states,
+key_states], dim=2)` with no `.update()` (`:436-452`); `is_causal = False`
+(`:384`). The generation loop is block-autoregressive — per block it "encode[s]
+all previous tokens using the encoder, to get the KV cache" then runs the inner
+denoising loop against that cache (`generation_diffusion_gemma.py:558-574`), and
+the live canvas is not cached (`:670`). The per-block encode is *incremental*
+(only `unprocessed_input_ids`, `:721`). Note `k_eq_v` is on the **global** layers
+(`v_proj = ... if self.is_sliding else None`, `:402-406`).
 
 **Reframe — frozen KV is read `S×` but that is *not* the bottleneck.** The
 tempting target is the `S×` re-read of frozen KV per block. But a denoise step
