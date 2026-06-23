@@ -283,3 +283,56 @@ independent, swappable components in our backend.
 | Cross-block update (6.7) | Refresh the previous block's KV at the seam in any approximate-cache design |
 | Composable parts (6.8) | Keep iteration/decoder/cache swappable |
 
+
+---
+
+## 8. LLaDA decode optimizations (model code) and the DiffusionGemma MoE check
+
+Inspecting the LLaDA model implementations (`model/modeling_fused_olmoe.py`,
+`modeling_llada2_moe*.py`) for "unexpected fusions or op order":
+
+**No exotic dLLM-specific kernel fusions.** The decode speed is *op-ordering*, not
+fusion:
+- **Block-local forward → sparse logits.** In the cached path the whole
+  transformer *and* `lm_head` run only over the active block (`q_len =
+  block_length`), attending the full cached KV. Logits are `[B, block_length, V]`,
+  not `[B, seq, V]`.
+- **`replace_position` + `slice_scatter` KV splice** (`modeling_fused_olmoe.py:607`)
+  — only the block's K/V are recomputed and scattered into the cached sequence KV.
+- **`position_ids` reconstruction** for the spliced block
+  (`:1012-1013`, `arange(replace_position[0], replace_position[1])`) so RoPE stays
+  correct under block-only compute.
+- **Self-conditioning fused as `softmax(logits/tau) @ W_e`** (`h2e`, `:228-234`):
+  prob-weighted token embedding **added** (not interpolated) to the discrete
+  embedding at mask positions, scaled by a ramping weight.
+
+**Fusions present are all standard / inherited** (not diffusion-specific):
+vLLM `FusedMoE` grouped-GEMM experts; `gate_up_proj` merge
+(`MergedColumnParallelLinear`, SGLang variant); DeepSeek-style group-limited
+top-k routing (`group_limited_topk`: sigmoid → per-group top-2 sum → `topk_group`
+groups → top-k, `routed_scaling_factor`) + shared experts in LLaDA2. The HF/Olmoe
+variant keeps **separate q/k/v** (no fused QKV).
+
+### DiffusionGemma MoE is different — author the router to match *it*, not LLaDA2
+
+Verified in transformers 5.12.1 (`modeling_diffusion_gemma.py:493-567`,
+`configuration_diffusion_gemma.py:108-110`). DiffusionGemma's MoE config exposes
+**only** `num_experts`, `top_k_experts`, `moe_intermediate_size` — no `n_group`,
+`topk_group`, `shared_expert`, or `routed_scaling_factor`. The router is:
+
+- **softmax** over all experts (not sigmoid), **plain top-k** (no group-limiting),
+  then normalize the top-k weights to sum to 1;
+- a **per-expert *learned* scale** `per_expert_scale[top_k_index]` applied to the
+  weights (unusual);
+- router input = `RMSNorm(no-scale)(h) * scale * hidden_size**-0.5`;
+- **no shared experts**.
+- Experts: `gate_up_proj` packed `[E, 2·I, H]` → `chunk(2)` → `act(gate)*up` →
+  `down_proj` `[E, H, I]`; config tp_plan maps experts to `grouped_gemm`.
+
+**Correction:** the earlier note to "match DeepSeek-style group-limited routing"
+was wrong for DiffusionGemma. Author a **simpler** SYCL router: softmax → plain
+top-k → renormalize → per-expert learned scale, no groups, no shared experts.
+Each expert FFN is exactly oneDNN `gated_mlp` (the packed `gate_up` → activation →
+`*up` → `down`), and the expert collection maps to a grouped-GEMM. The only
+diffusion-specific MoE concern is the per-step token→expert dispatch over the
+canvas (a SYCL scatter/gather, ref loop at `:549-565`).
