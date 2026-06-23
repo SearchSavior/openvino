@@ -120,13 +120,57 @@ baseline for cutting `S`.
 | Confidence/entropy multi-token accept | Confirmed + extended — threshold / hierarchy / credit / dynamic, all with a progress guarantee |
 | `CL` is a tunable (grow to amortize) | Confirmed it's a first-class knob; they run *smaller* (32–64), so sweep both directions |
 
-**Net new insight:** the single highest-value thing dInfer demonstrates that we
-had only hypothesized is that **approximate cross-denoising-step KV caching (recompute
-only the active block, hold prefix+suffix stale, refresh on a frequency) is
-production-viable and is where the order-of-magnitude speedup lives** — provided
-the refresh frequency is exposed as an accuracy/speed dial. That should move from
-"speculative #5, validate first" to a primary design element of our KV-cache
-manager, with `cache_update_freq` as a first-class parameter.
+**Net new insight (LLaDA context):** for a single bidirectional model (LLaDA),
+approximate cross-step KV caching (recompute only the active block, hold
+prefix+suffix stale, refresh on a frequency/window) is production-viable and is
+where the order-of-magnitude speedup lives — with the refresh policy as an
+accuracy/speed dial.
+
+> **⚠ Applicability to DiffusionGemma — see §7. Most of dInfer's cache cleverness
+> does NOT transfer**, because DiffusionGemma's architecture already provides
+> exactly what those approximations chase. The prefix-cache is the only cache
+> mechanism that carries over (and it's *exact* here, not approximate).
+
+---
+
+## 7. Which of these are correct for DiffusionGemma?
+
+dInfer's caches were built for **LLaDA**: one bidirectional model, full attention,
+the whole gen-region materialized as `[MASK]`. So prefix/dual/vicinity caches are
+all *approximations* of "recompute the full sequence's KV every step under
+bidirectional attention," trading accuracy for speed via stale/windowed KV.
+
+DiffusionGemma differs in two ways that decide what is correct (verified in the
+HF reference, transformers 5.12.1):
+1. **YOCO encoder/decoder split.** Prefix KV is *defined* as the causal encoder
+   output and is **read-only for every decoder layer** during denoising
+   (`modeling_diffusion_gemma.py:374-377`); the model is trained this way. Frozen
+   prefix KV is therefore exact-by-construction, not an approximation — there is
+   no drift to capture and no refresh frequency to tune.
+2. **Block-AR.** Only the current canvas is materialized; no suffix exists.
+3. Attention is **hybrid**: sliding (`sliding_window=512`) + global; canvas
+   `CL=256 < W`, so a whole canvas fits inside one window.
+
+| dInfer mechanism | DiffusionGemma verdict |
+|---|---|
+| **Prefix cache** | **Correct — and *exact* here** (vs approximate in LLaDA), thanks to the encoder/decoder split. Use it. |
+| **Cache-level sliding window** (present only ~`W` keys to sliding layers) | **Correct & exact** — this is the *real* sliding-window KV optimization (bounded read range + bounded memory). Distinct from anything dInfer does. |
+| Recompute canvas KV each step | **Required** (canvas changes each step). |
+| **Dual cache (suffix)** | **N/A** — no materialized suffix in block-AR. |
+| **Vicinity cache / `cache_update_freq` / cross-block refresh** | **N/A** — these refresh stale prefix KV; the read-only decoder never refreshes prefix KV, so there is nothing to schedule. The drift they fix doesn't exist here. (On a window-`W` layer, freezing positions beyond `W` is exact anyway.) |
+| Self-conditioning (ramped `h2e`) | **Already built in** as a trained SC MLP; dInfer's formulation differs — don't graft without retraining. |
+| Cross-block KV write | **Already built in** — it's the commit/encoder pass. |
+| **Annealed acceptance schedule** (6.2) | **Applies** (architecture-agnostic) — adapt it to anneal the `entropy_bound`. Likely `S` win. |
+| **Dynamic unroll** (6.3), **per-seq early exit** (6.4), **graph cache-length bucketing** (6.5), **sequence-parallel forward** (6.6) | **Apply** — all architecture-agnostic. |
+
+**Corrected bottom line for DiffusionGemma's KV cache:** there is no approximate
+caching to design. The plan is **exact prefix cache + cache-level sliding window
+(W keys on sliding layers) + per-step canvas recompute**. DiffusionGemma's YOCO
+split already *is* the exact version of what dInfer's dual/vicinity caches
+approximate, so those (and `cache_update_freq`) are unnecessary and partly
+inapplicable. The transferable wins are the **decode-schedule and runtime**
+tricks (annealed acceptance, unroll, batch early-exit, cache-length-bucketed
+graphs, sequence parallelism), not the caches.
 
 ---
 
